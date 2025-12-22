@@ -1,6 +1,6 @@
 [package]
 name = "libyaml-safer"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Simon Ask Ulsnes <simon@ulsnes.dk"]
 categories = ["encoding", "parser-implementations"]
 description = "Safer libyaml port, based on unsafe-libyaml"
