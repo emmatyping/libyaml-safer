@@ -15,7 +15,7 @@ use crate::{
 #[non_exhaustive]
 pub struct Emitter<'w> {
     /// Write handler.
-    pub(crate) write_handler: Option<&'w mut dyn std::io::Write>,
+    pub(crate) write_handler: Option<&'w mut (dyn std::io::Write + Send + Sync)>,
     /// The working buffer.
     ///
     /// This always contains valid UTF-8.
@@ -256,7 +256,7 @@ impl<'w> Emitter<'w> {
     }
 
     /// Set a generic output handler.
-    pub fn set_output(&mut self, handler: &'w mut dyn std::io::Write) {
+    pub fn set_output(&mut self, handler: &'w mut (dyn std::io::Write + Send + Sync)) {
         assert!(self.write_handler.is_none());
         self.write_handler = Some(handler);
     }
