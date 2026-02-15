@@ -1,14 +1,15 @@
-use crate::input::Input;
+use std::io::BufRead;
+
 use crate::scanner::Scanner;
 use crate::{
-    Error, Event, EventData, MappingStyle, Mark, Result, ScalarStyle, SequenceStyle,
+    Encoding, Error, Event, EventData, MappingStyle, Mark, Result, ScalarStyle, SequenceStyle,
     TagDirective, TokenData, VersionDirective,
 };
 
 /// The parser structure.
 #[non_exhaustive]
-pub struct Parser<I> {
-    pub(crate) scanner: Scanner<I>,
+pub struct Parser<R> {
+    pub(crate) scanner: Scanner<R>,
     pub(crate) inner: ParserInner,
 }
 
@@ -27,29 +28,9 @@ pub(crate) struct ParserInner {
     pub(crate) aliases: Vec<AliasData>,
 }
 
-impl<I: Input> Parser<I> {
-    /// Create a parser for the given input.
-    pub fn new(input: I) -> Parser<I> {
-        Parser {
-            scanner: Scanner::new(input),
-            inner: ParserInner {
-                states: Vec::with_capacity(16),
-                state: ParserState::default(),
-                marks: Vec::with_capacity(16),
-                tag_directives: Vec::with_capacity(16),
-                aliases: Vec::new(),
-            },
-        }
-    }
-
-    /// Reset the parser state with a new input.
-    pub fn reset(&mut self, input: I) {
-        self.scanner.reset(input);
-        self.inner.states.clear();
-        self.inner.state = ParserState::default();
-        self.inner.marks.clear();
-        self.inner.tag_directives.clear();
-        self.inner.aliases.clear();
+impl<R> Default for Parser<R> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -133,7 +114,7 @@ pub struct AliasData {
     pub mark: Mark,
 }
 
-impl<I: Input> Iterator for Parser<I> {
+impl<R: BufRead> Iterator for Parser<R> {
     type Item = Result<Event>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -145,9 +126,54 @@ impl<I: Input> Iterator for Parser<I> {
     }
 }
 
-impl<I: Input> core::iter::FusedIterator for Parser<I> {}
+impl<R: BufRead> core::iter::FusedIterator for Parser<R> {}
 
-impl<I: Input> Parser<I> {
+impl<R> Parser<R> {
+    /// Create a parser.
+    pub fn new() -> Parser<R> {
+        Parser {
+            scanner: Scanner::new(),
+            inner: ParserInner {
+                states: Vec::with_capacity(16),
+                state: ParserState::default(),
+                marks: Vec::with_capacity(16),
+                tag_directives: Vec::with_capacity(16),
+                aliases: Vec::new(),
+            },
+        }
+    }
+
+    /// Reset the parser state.
+    pub fn reset(&mut self) {
+        self.scanner.reset();
+
+        // Preserve allocations.
+        self.inner.states.clear();
+        self.inner.state = ParserState::default();
+        self.inner.marks.clear();
+        self.inner.tag_directives.clear();
+        self.inner.aliases.clear();
+    }
+}
+
+impl<'r, 'b> Parser<&'b mut &'r [u8]> {
+    /// Set a string input.
+    pub fn set_input_string(&mut self, input: &'r mut &'b [u8]) {
+        self.scanner.set_input_string(input);
+    }
+}
+
+impl<R: BufRead> Parser<R> {
+    /// Set a generic input handler.
+    pub fn set_input(&mut self, input: R) {
+        self.scanner.set_input(input);
+    }
+
+    /// Set the source encoding.
+    pub fn set_encoding(&mut self, encoding: Encoding) {
+        self.scanner.set_encoding(encoding);
+    }
+
     /// Parse the input stream and produce the next parsing event.
     ///
     /// Call the function subsequently to produce a sequence of events

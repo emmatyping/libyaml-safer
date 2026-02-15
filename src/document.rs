@@ -1,4 +1,4 @@
-use crate::input::Input;
+use std::io::BufRead;
 
 use crate::{
     AliasData, Anchors, DEFAULT_MAPPING_TAG, DEFAULT_SCALAR_TAG, DEFAULT_SEQUENCE_TAG, Emitter,
@@ -248,7 +248,7 @@ impl Document {
     ///
     /// An application must not alternate the calls of [`Document::load()`] with
     /// the calls of [`Parser::parse()`]. Doing this will break the parser.
-    pub fn load<I: Input>(parser: &mut Parser<I>) -> Result<Document> {
+    pub fn load<R: BufRead>(parser: &mut Parser<R>) -> Result<Document> {
         let mut document = Document::new(None, &[], false, false);
         document.nodes.reserve(16);
 
@@ -289,7 +289,7 @@ impl Document {
         Err(err)
     }
 
-    fn load_document<I: Input>(&mut self, parser: &mut Parser<I>, event: Event) -> Result<()> {
+    fn load_document<R: BufRead>(&mut self, parser: &mut Parser<R>, event: Event) -> Result<()> {
         let mut ctx = vec![];
         if let EventData::DocumentStart {
             version_directive,
@@ -313,7 +313,7 @@ impl Document {
         }
     }
 
-    fn load_nodes<I: Input>(&mut self, parser: &mut Parser<I>, ctx: &mut Vec<i32>) -> Result<()> {
+    fn load_nodes<R: BufRead>(&mut self, parser: &mut Parser<R>, ctx: &mut Vec<i32>) -> Result<()> {
         let end_implicit;
         let end_mark;
 

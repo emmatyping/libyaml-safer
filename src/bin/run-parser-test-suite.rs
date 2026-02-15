@@ -11,7 +11,7 @@
     clippy::too_many_lines
 )]
 
-use libyaml_safer::{EventData, Parser, ScalarStyle, StrInput};
+use libyaml_safer::{EventData, Parser, ScalarStyle};
 use std::env;
 use std::error::Error;
 use std::fs::File;
@@ -23,10 +23,10 @@ pub(crate) fn test_main(
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
-    let mut input_string = String::new();
-    stdin.read_to_string(&mut input_string)?;
+    let mut parser = Parser::new();
 
-    let mut parser = Parser::new(StrInput::new(&input_string));
+    let mut stdin = std::io::BufReader::new(stdin);
+    parser.set_input(&mut stdin);
 
     loop {
         let event = match parser.parse() {

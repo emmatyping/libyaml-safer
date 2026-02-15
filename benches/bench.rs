@@ -1,20 +1,19 @@
 use std::mem::MaybeUninit;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use libyaml_safer::{Document, Emitter, Parser, StrInput};
+use libyaml_safer::{Document, Emitter, Parser};
 use unsafe_libyaml::*;
 
 static VERY_LARGE_YAML: &[u8] = include_bytes!("very_large.yml");
 
 pub fn parser(c: &mut Criterion) {
-    let input_str =
-        core::str::from_utf8(VERY_LARGE_YAML).expect("benchmark YAML must be valid UTF-8");
-
     c.bench_function("libyaml-safer parse large", |b| {
         // Note: Not using `iter_with_large_drop` because that would be unfair
         // to unsafe-libyaml, which needs a call to `yaml_document_delete`.
         b.iter(|| {
-            let mut parser = Parser::new(StrInput::new(input_str));
+            let mut input = VERY_LARGE_YAML;
+            let mut parser = Parser::new();
+            parser.set_input(&mut input);
             Document::load(&mut parser)
         })
     });
@@ -45,7 +44,9 @@ pub fn parser(c: &mut Criterion) {
         let mut buffer = Vec::with_capacity(VERY_LARGE_YAML.len());
 
         let doc = {
-            let mut parser = Parser::new(StrInput::new(input_str));
+            let mut parser = Parser::new();
+            let mut input = VERY_LARGE_YAML;
+            parser.set_input(&mut input);
             Document::load(&mut parser).unwrap()
         };
 
