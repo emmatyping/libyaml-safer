@@ -1,12 +1,12 @@
 macro_rules! CHECK_AT {
     ($buffer:expr, $octet:expr, $offset:expr) => {
-        $buffer.get($offset) == Some(&$octet)
+        $buffer.get($offset).copied() == Some($octet)
     };
 }
 
 macro_rules! CHECK {
     ($buffer:expr, $octet:expr) => {
-        $buffer.get(0) == Some(&$octet)
+        $buffer.get(0).copied() == Some($octet)
     };
 }
 
