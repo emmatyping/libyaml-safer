@@ -28,8 +28,3 @@ rustdoc-args = ["--generate-link-to-definition"]
 [[bench]]
 name = "bench"
 harness = false
-
-[profile.release]
-lto = "thin"
-codegen-units = 1
-debug = true
