@@ -33,3 +33,6 @@ harness = false
 lto = "thin"
 codegen-units = 1
 debug = true
+
+[dependencies]
+arraydeque = "0.5.1"

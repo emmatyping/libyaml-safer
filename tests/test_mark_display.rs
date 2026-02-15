@@ -1,13 +1,11 @@
-use libyaml_safer::Parser;
+use libyaml_safer::{Parser, StrInput};
 
 /// Test that errors at the very beginning display as line 1 column 1.
 #[test]
 fn first_position() {
     const INVALID_YAML: &str = "\t";
 
-    let mut parser = Parser::new();
-    let mut input = INVALID_YAML.as_bytes();
-    parser.set_input_string(&mut input);
+    let parser = Parser::new(StrInput::new(INVALID_YAML));
 
     let result = parser.collect::<Result<Vec<_>, _>>();
 
@@ -28,9 +26,7 @@ fn first_position() {
 fn multiline_error() {
     const INVALID_YAML: &str = "---\nkey: \"missing closing quote";
 
-    let mut parser = Parser::new();
-    let mut input = INVALID_YAML.as_bytes();
-    parser.set_input_string(&mut input);
+    let parser = Parser::new(StrInput::new(INVALID_YAML));
 
     let result = parser.collect::<Result<Vec<_>, _>>();
 

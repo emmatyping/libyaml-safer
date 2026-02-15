@@ -1,31 +1,18 @@
 use std::collections::VecDeque;
-use std::io::BufRead;
 
-use crate::macros::{is_blankz, is_break};
-use crate::reader::yaml_parser_update_buffer;
-use crate::{
-    Encoding, Error, INPUT_BUFFER_SIZE, Mark, Result, ScalarStyle, SimpleKey, Token, TokenData,
-};
+use crate::char_traits::{is_blank, is_blank_or_breakz, is_break, is_hex, as_hex};
+use crate::input::Input;
+use crate::{Encoding, Error, Mark, Result, ScalarStyle, SimpleKey, Token, TokenData};
 
 const MAX_NUMBER_LENGTH: u64 = 9_u64;
 
-/// Given an input stream of bytes, produce a stream of [`Token`]s.
+/// Given an input stream of characters, produce a stream of [`Token`]s.
 ///
 /// This is used internally by the parser, and may also be used standalone as a
 /// replacement for the libyaml `yaml_parser_scan()` function.
-pub struct Scanner<R> {
-    /// Read handler.
-    pub(crate) read_handler: Option<R>,
-    /// EOF flag
-    pub(crate) eof: bool,
-    /// The working buffer.
-    ///
-    /// This always contains valid UTF-8.
-    pub(crate) buffer: VecDeque<char>,
-    /// The input encoding.
-    pub(crate) encoding: Encoding,
-    /// The offset of the current position (in bytes).
-    pub(crate) offset: usize,
+pub struct Scanner<I> {
+    /// The input source.
+    pub(crate) input: I,
     /// The mark of the current position.
     pub(crate) mark: Mark,
     /// Have we started to scan the input stream?
@@ -50,22 +37,11 @@ pub struct Scanner<R> {
     pub(crate) simple_keys: Vec<SimpleKey>,
 }
 
-impl<'r, 'b> Scanner<&'r mut &'b [u8]> {
-    /// Set a string input.
-    pub fn set_input_string(&mut self, input: &'r mut &'b [u8]) {
-        assert!((self.read_handler).is_none());
-        self.read_handler = Some(input);
-    }
-}
-
-impl<R> Scanner<R> {
-    pub fn new() -> Scanner<R> {
+impl<I: Input> Scanner<I> {
+    /// Create a new scanner for the given input.
+    pub fn new(input: I) -> Scanner<I> {
         Self {
-            read_handler: None,
-            eof: false,
-            buffer: VecDeque::with_capacity(INPUT_BUFFER_SIZE),
-            encoding: Encoding::Any,
-            offset: 0,
+            input,
             mark: Mark::default(),
             stream_start_produced: false,
             stream_end_produced: false,
@@ -80,25 +56,9 @@ impl<R> Scanner<R> {
         }
     }
 
-    /// Set a generic input handler.
-    pub fn set_input(&mut self, input: R) {
-        assert!((self.read_handler).is_none());
-        self.read_handler = Some(input);
-    }
-
-    /// Set the source encoding.
-    pub fn set_encoding(&mut self, encoding: Encoding) {
-        assert!(self.encoding == Encoding::Any);
-        self.encoding = encoding;
-    }
-
-    /// Reset the scanner, preserving internal allocations.
-    pub fn reset(&mut self) {
-        self.read_handler = None;
-        self.eof = false;
-        self.buffer.clear();
-        self.encoding = Encoding::Any;
-        self.offset = 0;
+    /// Reset the scanner with a new input, preserving internal allocations.
+    pub fn reset(&mut self, input: I) {
+        self.input = input;
         self.mark = Mark::default();
         self.stream_start_produced = false;
         self.stream_end_produced = false;
@@ -111,72 +71,61 @@ impl<R> Scanner<R> {
         self.simple_key_allowed = false;
         self.simple_keys.clear();
     }
-}
 
-impl<R: BufRead> Scanner<R> {
-    fn cache(&mut self, length: usize) -> Result<()> {
-        if self.buffer.len() >= length {
-            Ok(())
-        } else {
-            yaml_parser_update_buffer(self, length)
-        }
-    }
+    // -----------------------------------------------------------------------
+    // Low-level input helpers
+    // -----------------------------------------------------------------------
 
-    /// Equivalent to the libyaml macro `SKIP`.
+    /// Skip one character, advancing the mark.
+    #[inline]
     fn skip_char(&mut self) {
-        let popped = self.buffer.pop_front().expect("unexpected end of tokens");
-        let width = popped.len_utf8();
-        self.mark.index += width as u64;
+        let ch = self.input.peek();
+        self.input.skip();
+        self.mark.index += ch.len_utf8() as u64;
         self.mark.column += 1;
     }
 
-    /// Equivalent to the libyaml macro `SKIP_LINE`.
-    fn skip_line_break(&mut self) {
-        if let Some(front) = self.buffer.front().copied() {
-            if let ('\r', Some('\n')) = (front, self.buffer.get(1).copied()) {
-                self.mark.index += 2;
-                self.mark.column = 0;
-                self.mark.line += 1;
-                self.buffer.drain(0..2);
-            } else if is_break(front) {
-                let width = front.len_utf8();
-                self.mark.index += width as u64;
-                self.mark.column = 0;
-                self.mark.line += 1;
-                self.buffer.pop_front();
-            }
-        }
-    }
-
-    /// Equivalent to the libyaml macro `READ`.
+    /// Read one character into `string`, advancing the mark.
+    #[inline]
     fn read_char(&mut self, string: &mut String) {
-        if let Some(popped) = self.buffer.pop_front() {
-            string.push(popped);
-            self.mark.index += popped.len_utf8() as u64;
-            self.mark.column += 1;
-        } else {
-            panic!("unexpected end of input")
-        }
+        let ch = self.input.peek();
+        string.push(ch);
+        self.input.skip();
+        self.mark.index += ch.len_utf8() as u64;
+        self.mark.column += 1;
     }
 
-    /// Equivalent to the libyaml macro `READ_LINE`.
-    fn read_line_break(&mut self, string: &mut String) {
-        let front = match self.buffer.front().copied() {
-            Some(front) => front,
-            None => panic!("unexpected end of input"),
-        };
-
-        if let ('\r', Some('\n')) = (front, self.buffer.get(1).copied()) {
-            string.push('\n');
-            self.buffer.drain(0..2);
+    /// Skip a line break sequence (\r\n, \r, \n, or Unicode break), advancing the mark.
+    fn skip_line_break(&mut self) {
+        let front = self.input.peek();
+        if front == '\r' && self.input.peek_nth(1) == '\n' {
+            self.input.skip_n(2);
             self.mark.index += 2;
             self.mark.column = 0;
             self.mark.line += 1;
         } else if is_break(front) {
-            self.buffer.pop_front();
+            let width = front.len_utf8();
+            self.input.skip();
+            self.mark.index += width as u64;
+            self.mark.column = 0;
+            self.mark.line += 1;
+        }
+    }
+
+    /// Read a line break sequence into `string`, advancing the mark.
+    fn read_line_break(&mut self, string: &mut String) {
+        let front = self.input.peek();
+        if front == '\r' && self.input.peek_nth(1) == '\n' {
+            string.push('\n');
+            self.input.skip_n(2);
+            self.mark.index += 2;
+            self.mark.column = 0;
+            self.mark.line += 1;
+        } else if is_break(front) {
+            self.input.skip();
             let char_len = front.len_utf8();
             if char_len == 3 {
-                // libyaml preserves Unicode breaks in this case.
+                // libyaml preserves Unicode breaks (LS, PS) as-is.
                 string.push(front);
             } else {
                 string.push('\n');
@@ -186,6 +135,10 @@ impl<R: BufRead> Scanner<R> {
             self.mark.line += 1;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Public scanning API
+    // -----------------------------------------------------------------------
 
     /// Scan the input stream and produce the next token.
     ///
@@ -277,6 +230,10 @@ impl<R: BufRead> Scanner<R> {
         Err(Error::scanner(context, context_mark, problem, self.mark))
     }
 
+    // -----------------------------------------------------------------------
+    // Token fetching
+    // -----------------------------------------------------------------------
+
     pub(crate) fn fetch_more_tokens(&mut self) -> Result<()> {
         let mut need_more_tokens;
         loop {
@@ -302,7 +259,7 @@ impl<R: BufRead> Scanner<R> {
     }
 
     fn fetch_next_token(&mut self) -> Result<()> {
-        self.cache(1)?;
+        self.input.lookahead(1);
         if !self.stream_start_produced {
             self.fetch_stream_start();
             return Ok(());
@@ -310,98 +267,102 @@ impl<R: BufRead> Scanner<R> {
         self.scan_to_next_token()?;
         self.stale_simple_keys()?;
         self.unroll_indent(self.mark.column as i64);
-        self.cache(4)?;
-        if IS_Z!(self.buffer) {
+        self.input.lookahead(4);
+        if self.input.next_is_z() {
             return self.fetch_stream_end();
         }
-        if self.mark.column == 0_u64 && self.buffer[0] == '%' {
+        if self.mark.column == 0_u64 && self.input.next_char_is('%') {
             return self.fetch_directive();
         }
         if self.mark.column == 0_u64
-            && CHECK_AT!(self.buffer, '-', 0)
-            && CHECK_AT!(self.buffer, '-', 1)
-            && CHECK_AT!(self.buffer, '-', 2)
-            && is_blankz(self.buffer.get(3).copied())
+            && self.input.nth_char_is(0, '-')
+            && self.input.nth_char_is(1, '-')
+            && self.input.nth_char_is(2, '-')
+            && is_blank_or_breakz(self.input.peek_nth(3))
         {
             return self.fetch_document_indicator(TokenData::DocumentStart);
         }
         if self.mark.column == 0_u64
-            && CHECK_AT!(self.buffer, '.', 0)
-            && CHECK_AT!(self.buffer, '.', 1)
-            && CHECK_AT!(self.buffer, '.', 2)
-            && is_blankz(self.buffer.get(3).copied())
+            && self.input.nth_char_is(0, '.')
+            && self.input.nth_char_is(1, '.')
+            && self.input.nth_char_is(2, '.')
+            && is_blank_or_breakz(self.input.peek_nth(3))
         {
             return self.fetch_document_indicator(TokenData::DocumentEnd);
         }
-        if CHECK!(self.buffer, '[') {
+        if self.input.next_char_is('[') {
             return self.fetch_flow_collection_start(TokenData::FlowSequenceStart);
         }
-        if CHECK!(self.buffer, '{') {
+        if self.input.next_char_is('{') {
             return self.fetch_flow_collection_start(TokenData::FlowMappingStart);
         }
-        if CHECK!(self.buffer, ']') {
+        if self.input.next_char_is(']') {
             return self.fetch_flow_collection_end(TokenData::FlowSequenceEnd);
         }
-        if CHECK!(self.buffer, '}') {
+        if self.input.next_char_is('}') {
             return self.fetch_flow_collection_end(TokenData::FlowMappingEnd);
         }
-        if CHECK!(self.buffer, ',') {
+        if self.input.next_char_is(',') {
             return self.fetch_flow_entry();
         }
-        if CHECK!(self.buffer, '-') && IS_BLANKZ_AT!(self.buffer, 1) {
+        if self.input.next_char_is('-') && is_blank_or_breakz(self.input.peek_nth(1)) {
             return self.fetch_block_entry();
         }
-        if CHECK!(self.buffer, '?') && (self.flow_level != 0 || IS_BLANKZ_AT!(self.buffer, 1)) {
+        if self.input.next_char_is('?')
+            && (self.flow_level != 0 || is_blank_or_breakz(self.input.peek_nth(1)))
+        {
             return self.fetch_key();
         }
-        if CHECK!(self.buffer, ':') && (self.flow_level != 0 || IS_BLANKZ_AT!(self.buffer, 1)) {
+        if self.input.next_char_is(':')
+            && (self.flow_level != 0 || is_blank_or_breakz(self.input.peek_nth(1)))
+        {
             return self.fetch_value();
         }
-        if CHECK!(self.buffer, '*') {
+        if self.input.next_char_is('*') {
             return self.fetch_anchor(true);
         }
-        if CHECK!(self.buffer, '&') {
+        if self.input.next_char_is('&') {
             return self.fetch_anchor(false);
         }
-        if CHECK!(self.buffer, '!') {
+        if self.input.next_char_is('!') {
             return self.fetch_tag();
         }
-        if CHECK!(self.buffer, '|') && self.flow_level == 0 {
+        if self.input.next_char_is('|') && self.flow_level == 0 {
             return self.fetch_block_scalar(true);
         }
-        if CHECK!(self.buffer, '>') && self.flow_level == 0 {
+        if self.input.next_char_is('>') && self.flow_level == 0 {
             return self.fetch_block_scalar(false);
         }
-        if CHECK!(self.buffer, '\'') {
+        if self.input.next_char_is('\'') {
             return self.fetch_flow_scalar(true);
         }
-        if CHECK!(self.buffer, '"') {
+        if self.input.next_char_is('"') {
             return self.fetch_flow_scalar(false);
         }
-        if !(IS_BLANKZ!(self.buffer)
-            || CHECK!(self.buffer, '-')
-            || CHECK!(self.buffer, '?')
-            || CHECK!(self.buffer, ':')
-            || CHECK!(self.buffer, ',')
-            || CHECK!(self.buffer, '[')
-            || CHECK!(self.buffer, ']')
-            || CHECK!(self.buffer, '{')
-            || CHECK!(self.buffer, '}')
-            || CHECK!(self.buffer, '#')
-            || CHECK!(self.buffer, '&')
-            || CHECK!(self.buffer, '*')
-            || CHECK!(self.buffer, '!')
-            || CHECK!(self.buffer, '|')
-            || CHECK!(self.buffer, '>')
-            || CHECK!(self.buffer, '\'')
-            || CHECK!(self.buffer, '"')
-            || CHECK!(self.buffer, '%')
-            || CHECK!(self.buffer, '@')
-            || CHECK!(self.buffer, '`'))
-            || CHECK!(self.buffer, '-') && !IS_BLANK_AT!(self.buffer, 1)
+        if !(self.input.next_is_blank_or_breakz()
+            || self.input.next_char_is('-')
+            || self.input.next_char_is('?')
+            || self.input.next_char_is(':')
+            || self.input.next_char_is(',')
+            || self.input.next_char_is('[')
+            || self.input.next_char_is(']')
+            || self.input.next_char_is('{')
+            || self.input.next_char_is('}')
+            || self.input.next_char_is('#')
+            || self.input.next_char_is('&')
+            || self.input.next_char_is('*')
+            || self.input.next_char_is('!')
+            || self.input.next_char_is('|')
+            || self.input.next_char_is('>')
+            || self.input.next_char_is('\'')
+            || self.input.next_char_is('"')
+            || self.input.next_char_is('%')
+            || self.input.next_char_is('@')
+            || self.input.next_char_is('`'))
+            || self.input.next_char_is('-') && !is_blank(self.input.peek_nth(1))
             || self.flow_level == 0
-                && (CHECK!(self.buffer, '?') || CHECK!(self.buffer, ':'))
-                && !IS_BLANKZ_AT!(self.buffer, 1)
+                && (self.input.next_char_is('?') || self.input.next_char_is(':'))
+                && !is_blank_or_breakz(self.input.peek_nth(1))
         {
             return self.fetch_plain_scalar();
         }
@@ -411,6 +372,10 @@ impl<R: BufRead> Scanner<R> {
             "found character that cannot start any token",
         )
     }
+
+    // -----------------------------------------------------------------------
+    // Simple key handling
+    // -----------------------------------------------------------------------
 
     fn stale_simple_keys(&mut self) -> Result<()> {
         for simple_key in &mut self.simple_keys {
@@ -463,6 +428,10 @@ impl<R: BufRead> Scanner<R> {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Flow level / indentation
+    // -----------------------------------------------------------------------
+
     fn increase_flow_level(&mut self) -> Result<()> {
         let empty_simple_key = SimpleKey {
             possible: false,
@@ -490,7 +459,13 @@ impl<R: BufRead> Scanner<R> {
         }
     }
 
-    fn roll_indent(&mut self, column: i64, number: i64, data: TokenData, mark: Mark) -> Result<()> {
+    fn roll_indent(
+        &mut self,
+        column: i64,
+        number: i64,
+        data: TokenData,
+        mark: Mark,
+    ) -> Result<()> {
         if self.flow_level != 0 {
             return Ok(());
         }
@@ -528,6 +503,10 @@ impl<R: BufRead> Scanner<R> {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Fetch helpers
+    // -----------------------------------------------------------------------
+
     fn fetch_stream_start(&mut self) {
         let simple_key = SimpleKey {
             possible: false,
@@ -545,7 +524,7 @@ impl<R: BufRead> Scanner<R> {
         self.stream_start_produced = true;
         let token = Token {
             data: TokenData::StreamStart {
-                encoding: self.encoding,
+                encoding: Encoding::Utf8,
             },
             start_mark: self.mark,
             end_mark: self.mark,
@@ -798,29 +777,34 @@ impl<R: BufRead> Scanner<R> {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Scanning
+    // -----------------------------------------------------------------------
+
     fn scan_to_next_token(&mut self) -> Result<()> {
         loop {
-            self.cache(1)?;
-            if self.mark.column == 0 && IS_BOM!(self.buffer) {
+            self.input.lookahead(1);
+            if self.mark.column == 0 && self.input.next_is_bom() {
                 self.skip_char();
             }
-            self.cache(1)?;
-            while CHECK!(self.buffer, ' ')
-                || (self.flow_level != 0 || !self.simple_key_allowed) && CHECK!(self.buffer, '\t')
+            self.input.lookahead(1);
+            while self.input.next_char_is(' ')
+                || (self.flow_level != 0 || !self.simple_key_allowed)
+                    && self.input.next_char_is('\t')
             {
                 self.skip_char();
-                self.cache(1)?;
+                self.input.lookahead(1);
             }
-            if CHECK!(self.buffer, '#') {
-                while !IS_BREAKZ!(self.buffer) {
+            if self.input.next_char_is('#') {
+                while !self.input.next_is_breakz() {
                     self.skip_char();
-                    self.cache(1)?;
+                    self.input.lookahead(1);
                 }
             }
-            if !IS_BREAK!(self.buffer) {
+            if !self.input.next_is_break() {
                 break;
             }
-            self.cache(2)?;
+            self.input.lookahead(2);
             self.skip_line_break();
             if self.flow_level == 0 {
                 self.simple_key_allowed = true;
@@ -860,28 +844,28 @@ impl<R: BufRead> Scanner<R> {
                 "found unknown directive name",
             );
         };
-        self.cache(1)?;
+        self.input.lookahead(1);
         loop {
-            if !IS_BLANK!(self.buffer) {
+            if !self.input.next_is_blank() {
                 break;
             }
             self.skip_char();
-            self.cache(1)?;
+            self.input.lookahead(1);
         }
 
-        if CHECK!(self.buffer, '#') {
+        if self.input.next_char_is('#') {
             loop {
-                if IS_BREAKZ!(self.buffer) {
+                if self.input.next_is_breakz() {
                     break;
                 }
                 self.skip_char();
-                self.cache(1)?;
+                self.input.lookahead(1);
             }
         }
 
-        if IS_BREAKZ!(self.buffer) {
-            if IS_BREAK!(self.buffer) {
-                self.cache(2)?;
+        if self.input.next_is_breakz() {
+            if self.input.next_is_break() {
+                self.input.lookahead(2);
                 self.skip_line_break();
             }
             Ok(token)
@@ -896,14 +880,14 @@ impl<R: BufRead> Scanner<R> {
 
     fn scan_directive_name(&mut self, start_mark: Mark) -> Result<String> {
         let mut string = String::new();
-        self.cache(1)?;
+        self.input.lookahead(1);
 
         loop {
-            if !IS_ALPHA!(self.buffer) {
+            if !self.input.next_is_alpha() {
                 break;
             }
             self.read_char(&mut string);
-            self.cache(1)?;
+            self.input.lookahead(1);
         }
 
         if string.is_empty() {
@@ -912,7 +896,7 @@ impl<R: BufRead> Scanner<R> {
                 start_mark,
                 "could not find expected directive name",
             )
-        } else if !IS_BLANKZ!(self.buffer) {
+        } else if !self.input.next_is_blank_or_breakz() {
             self.set_scanner_error(
                 "while scanning a directive",
                 start_mark,
@@ -929,13 +913,13 @@ impl<R: BufRead> Scanner<R> {
         major: &mut i32,
         minor: &mut i32,
     ) -> Result<()> {
-        self.cache(1)?;
-        while IS_BLANK!(self.buffer) {
+        self.input.lookahead(1);
+        while self.input.next_is_blank() {
             self.skip_char();
-            self.cache(1)?;
+            self.input.lookahead(1);
         }
         self.scan_version_directive_number(start_mark, major)?;
-        if !CHECK!(self.buffer, '.') {
+        if !self.input.next_char_is('.') {
             return self.set_scanner_error(
                 "while scanning a %YAML directive",
                 start_mark,
@@ -946,11 +930,15 @@ impl<R: BufRead> Scanner<R> {
         self.scan_version_directive_number(start_mark, minor)
     }
 
-    fn scan_version_directive_number(&mut self, start_mark: Mark, number: &mut i32) -> Result<()> {
+    fn scan_version_directive_number(
+        &mut self,
+        start_mark: Mark,
+        number: &mut i32,
+    ) -> Result<()> {
         let mut value: i32 = 0;
         let mut length = 0;
-        self.cache(1)?;
-        while IS_DIGIT!(self.buffer) {
+        self.input.lookahead(1);
+        while self.input.next_is_digit() {
             length += 1;
             if length > MAX_NUMBER_LENGTH {
                 return self.set_scanner_error(
@@ -959,9 +947,9 @@ impl<R: BufRead> Scanner<R> {
                     "found extremely long version number",
                 );
             }
-            value = (value * 10) + AS_DIGIT!(self.buffer) as i32;
+            value = (value * 10) + self.input.peek().to_digit(10).unwrap() as i32;
             self.skip_char();
-            self.cache(1)?;
+            self.input.lookahead(1);
         }
         if length == 0 {
             return self.set_scanner_error(
@@ -976,18 +964,18 @@ impl<R: BufRead> Scanner<R> {
 
     // Returns (handle, prefix)
     fn scan_tag_directive_value(&mut self, start_mark: Mark) -> Result<(String, String)> {
-        self.cache(1)?;
+        self.input.lookahead(1);
 
         loop {
-            if IS_BLANK!(self.buffer) {
+            if self.input.next_is_blank() {
                 self.skip_char();
-                self.cache(1)?;
+                self.input.lookahead(1);
             } else {
                 let handle_value = self.scan_tag_handle(true, start_mark)?;
 
-                self.cache(1)?;
+                self.input.lookahead(1);
 
-                if !IS_BLANK!(self.buffer) {
+                if !self.input.next_is_blank() {
                     return self.set_scanner_error(
                         "while scanning a %TAG directive",
                         start_mark,
@@ -995,15 +983,15 @@ impl<R: BufRead> Scanner<R> {
                     );
                 }
 
-                while IS_BLANK!(self.buffer) {
+                while self.input.next_is_blank() {
                     self.skip_char();
-                    self.cache(1)?;
+                    self.input.lookahead(1);
                 }
 
                 let prefix_value = self.scan_tag_uri(true, true, None, start_mark)?;
-                self.cache(1)?;
+                self.input.lookahead(1);
 
-                if !IS_BLANKZ!(self.buffer) {
+                if !self.input.next_is_blank_or_breakz() {
                     return self.set_scanner_error(
                         "while scanning a %TAG directive",
                         start_mark,
@@ -1021,27 +1009,27 @@ impl<R: BufRead> Scanner<R> {
         let mut string = String::new();
         let start_mark: Mark = self.mark;
         self.skip_char();
-        self.cache(1)?;
+        self.input.lookahead(1);
 
         loop {
-            if !IS_ALPHA!(self.buffer) {
+            if !self.input.next_is_alpha() {
                 break;
             }
             self.read_char(&mut string);
-            self.cache(1)?;
+            self.input.lookahead(1);
             length += 1;
         }
         let end_mark: Mark = self.mark;
         if length == 0
-            || !(IS_BLANKZ!(self.buffer)
-                || CHECK!(self.buffer, '?')
-                || CHECK!(self.buffer, ':')
-                || CHECK!(self.buffer, ',')
-                || CHECK!(self.buffer, ']')
-                || CHECK!(self.buffer, '}')
-                || CHECK!(self.buffer, '%')
-                || CHECK!(self.buffer, '@')
-                || CHECK!(self.buffer, '`'))
+            || !(self.input.next_is_blank_or_breakz()
+                || self.input.next_char_is('?')
+                || self.input.next_char_is(':')
+                || self.input.next_char_is(',')
+                || self.input.next_char_is(']')
+                || self.input.next_char_is('}')
+                || self.input.next_char_is('%')
+                || self.input.next_char_is('@')
+                || self.input.next_char_is('`'))
         {
             self.set_scanner_error(
                 if scan_alias_instead_of_anchor {
@@ -1071,15 +1059,15 @@ impl<R: BufRead> Scanner<R> {
 
         let start_mark: Mark = self.mark;
 
-        self.cache(2)?;
+        self.input.lookahead(2);
 
-        if CHECK_AT!(self.buffer, '<', 1) {
+        if self.input.nth_char_is(1, '<') {
             handle = String::new();
             self.skip_char();
             self.skip_char();
             suffix = self.scan_tag_uri(true, false, None, start_mark)?;
 
-            if !CHECK!(self.buffer, '>') {
+            if !self.input.next_char_is('>') {
                 return self.set_scanner_error(
                     "while scanning a tag",
                     start_mark,
@@ -1100,16 +1088,16 @@ impl<R: BufRead> Scanner<R> {
             }
         }
 
-        self.cache(1)?;
-        if !IS_BLANKZ!(self.buffer) {
-            if self.flow_level == 0 || !CHECK!(self.buffer, ',') {
+        self.input.lookahead(1);
+        if !self.input.next_is_blank_or_breakz() {
+            if self.flow_level == 0 || !self.input.next_char_is(',') {
                 return self.set_scanner_error(
                     "while scanning a tag",
                     start_mark,
                     "did not find expected whitespace or line break",
                 );
             }
-            panic!("TODO: What is expected here?");
+            // In flow context, a tag can be followed by ',' without whitespace.
         }
 
         let end_mark: Mark = self.mark;
@@ -1122,9 +1110,9 @@ impl<R: BufRead> Scanner<R> {
 
     fn scan_tag_handle(&mut self, directive: bool, start_mark: Mark) -> Result<String> {
         let mut string = String::new();
-        self.cache(1)?;
+        self.input.lookahead(1);
 
-        if !CHECK!(self.buffer, '!') {
+        if !self.input.next_char_is('!') {
             return self.set_scanner_error(
                 if directive {
                     "while scanning a tag directive"
@@ -1137,15 +1125,15 @@ impl<R: BufRead> Scanner<R> {
         }
 
         self.read_char(&mut string);
-        self.cache(1)?;
+        self.input.lookahead(1);
         loop {
-            if !IS_ALPHA!(self.buffer) {
+            if !self.input.next_is_alpha() {
                 break;
             }
             self.read_char(&mut string);
-            self.cache(1)?;
+            self.input.lookahead(1);
         }
-        if CHECK!(self.buffer, '!') {
+        if self.input.next_char_is('!') {
             self.read_char(&mut string);
         } else if directive && string != "!" {
             return self.set_scanner_error(
@@ -1171,38 +1159,38 @@ impl<R: BufRead> Scanner<R> {
         if length > 1 {
             string = String::from(&head[1..]);
         }
-        self.cache(1)?;
+        self.input.lookahead(1);
 
-        while IS_ALPHA!(self.buffer)
-            || CHECK!(self.buffer, ';')
-            || CHECK!(self.buffer, '/')
-            || CHECK!(self.buffer, '?')
-            || CHECK!(self.buffer, ':')
-            || CHECK!(self.buffer, '@')
-            || CHECK!(self.buffer, '&')
-            || CHECK!(self.buffer, '=')
-            || CHECK!(self.buffer, '+')
-            || CHECK!(self.buffer, '$')
-            || CHECK!(self.buffer, '.')
-            || CHECK!(self.buffer, '%')
-            || CHECK!(self.buffer, '!')
-            || CHECK!(self.buffer, '~')
-            || CHECK!(self.buffer, '*')
-            || CHECK!(self.buffer, '\'')
-            || CHECK!(self.buffer, '(')
-            || CHECK!(self.buffer, ')')
+        while self.input.next_is_alpha()
+            || self.input.next_char_is(';')
+            || self.input.next_char_is('/')
+            || self.input.next_char_is('?')
+            || self.input.next_char_is(':')
+            || self.input.next_char_is('@')
+            || self.input.next_char_is('&')
+            || self.input.next_char_is('=')
+            || self.input.next_char_is('+')
+            || self.input.next_char_is('$')
+            || self.input.next_char_is('.')
+            || self.input.next_char_is('%')
+            || self.input.next_char_is('!')
+            || self.input.next_char_is('~')
+            || self.input.next_char_is('*')
+            || self.input.next_char_is('\'')
+            || self.input.next_char_is('(')
+            || self.input.next_char_is(')')
             || uri_char
-                && (CHECK!(self.buffer, ',')
-                    || CHECK!(self.buffer, '[')
-                    || CHECK!(self.buffer, ']'))
+                && (self.input.next_char_is(',')
+                    || self.input.next_char_is('[')
+                    || self.input.next_char_is(']'))
         {
-            if CHECK!(self.buffer, '%') {
+            if self.input.next_char_is('%') {
                 self.scan_uri_escapes(directive, start_mark, &mut string)?;
             } else {
                 self.read_char(&mut string);
             }
             length += 1;
-            self.cache(1)?;
+            self.input.lookahead(1);
         }
         if length == 0 {
             self.set_scanner_error(
@@ -1227,10 +1215,10 @@ impl<R: BufRead> Scanner<R> {
     ) -> Result<()> {
         let mut width: i32 = 0;
         loop {
-            self.cache(3)?;
-            if !(CHECK!(self.buffer, '%')
-                && IS_HEX_AT!(self.buffer, 1)
-                && IS_HEX_AT!(self.buffer, 2))
+            self.input.lookahead(3);
+            if !(self.input.next_char_is('%')
+                && is_hex(self.input.peek_nth(1))
+                && is_hex(self.input.peek_nth(2)))
             {
                 return self.set_scanner_error(
                     if directive {
@@ -1242,7 +1230,8 @@ impl<R: BufRead> Scanner<R> {
                     "did not find URI escaped octet",
                 );
             }
-            let octet = ((AS_HEX_AT!(self.buffer, 1) << 4) + AS_HEX_AT!(self.buffer, 2)) as u8;
+            let octet =
+                ((as_hex(self.input.peek_nth(1)) << 4) + as_hex(self.input.peek_nth(2))) as u8;
             if width == 0 {
                 width = if octet & 0x80 == 0 {
                     1
@@ -1302,60 +1291,68 @@ impl<R: BufRead> Scanner<R> {
         let mut trailing_blank: i32;
         let start_mark: Mark = self.mark;
         self.skip_char();
-        self.cache(1)?;
+        self.input.lookahead(1);
 
-        if CHECK!(self.buffer, '+') || CHECK!(self.buffer, '-') {
-            chomping = if CHECK!(self.buffer, '+') { 1 } else { -1 };
+        if self.input.next_char_is('+') || self.input.next_char_is('-') {
+            chomping = if self.input.next_char_is('+') {
+                1
+            } else {
+                -1
+            };
             self.skip_char();
-            self.cache(1)?;
-            if IS_DIGIT!(self.buffer) {
-                if CHECK!(self.buffer, '0') {
+            self.input.lookahead(1);
+            if self.input.next_is_digit() {
+                if self.input.next_char_is('0') {
                     return self.set_scanner_error(
                         "while scanning a block scalar",
                         start_mark,
                         "found an indentation indicator equal to 0",
                     );
                 }
-                increment = AS_DIGIT!(self.buffer) as i32;
+                increment = self.input.peek().to_digit(10).unwrap() as i32;
                 self.skip_char();
             }
-        } else if IS_DIGIT!(self.buffer) {
-            if CHECK!(self.buffer, '0') {
+        } else if self.input.next_is_digit() {
+            if self.input.next_char_is('0') {
                 return self.set_scanner_error(
                     "while scanning a block scalar",
                     start_mark,
                     "found an indentation indicator equal to 0",
                 );
             }
-            increment = AS_DIGIT!(self.buffer) as i32;
+            increment = self.input.peek().to_digit(10).unwrap() as i32;
             self.skip_char();
-            self.cache(1)?;
-            if CHECK!(self.buffer, '+') || CHECK!(self.buffer, '-') {
-                chomping = if CHECK!(self.buffer, '+') { 1 } else { -1 };
+            self.input.lookahead(1);
+            if self.input.next_char_is('+') || self.input.next_char_is('-') {
+                chomping = if self.input.next_char_is('+') {
+                    1
+                } else {
+                    -1
+                };
                 self.skip_char();
             }
         }
 
-        self.cache(1)?;
+        self.input.lookahead(1);
         loop {
-            if !IS_BLANK!(self.buffer) {
+            if !self.input.next_is_blank() {
                 break;
             }
             self.skip_char();
-            self.cache(1)?;
+            self.input.lookahead(1);
         }
 
-        if CHECK!(self.buffer, '#') {
+        if self.input.next_char_is('#') {
             loop {
-                if IS_BREAKZ!(self.buffer) {
+                if self.input.next_is_breakz() {
                     break;
                 }
                 self.skip_char();
-                self.cache(1)?;
+                self.input.lookahead(1);
             }
         }
 
-        if !IS_BREAKZ!(self.buffer) {
+        if !self.input.next_is_breakz() {
             return self.set_scanner_error(
                 "while scanning a block scalar",
                 start_mark,
@@ -1363,8 +1360,8 @@ impl<R: BufRead> Scanner<R> {
             );
         }
 
-        if IS_BREAK!(self.buffer) {
-            self.cache(2)?;
+        if self.input.next_is_break() {
+            self.input.lookahead(2);
             self.skip_line_break();
         }
 
@@ -1383,13 +1380,13 @@ impl<R: BufRead> Scanner<R> {
             &mut end_mark,
         )?;
 
-        self.cache(1)?;
+        self.input.lookahead(1);
 
         loop {
-            if self.mark.column as i32 != indent || IS_Z!(self.buffer) {
+            if self.mark.column as i32 != indent || self.input.next_is_z() {
                 break;
             }
-            trailing_blank = IS_BLANK!(self.buffer) as i32;
+            trailing_blank = self.input.next_is_blank() as i32;
             if !literal
                 && leading_break.starts_with('\n')
                 && leading_blank == 0
@@ -1405,12 +1402,12 @@ impl<R: BufRead> Scanner<R> {
             }
             string.push_str(&trailing_breaks);
             trailing_breaks.clear();
-            leading_blank = IS_BLANK!(self.buffer) as i32;
-            while !IS_BREAKZ!(self.buffer) {
+            leading_blank = self.input.next_is_blank() as i32;
+            while !self.input.next_is_breakz() {
                 self.read_char(&mut string);
-                self.cache(1)?;
+                self.input.lookahead(1);
             }
-            self.cache(2)?;
+            self.input.lookahead(2);
             self.read_line_break(&mut leading_break);
             self.scan_block_scalar_breaks(
                 &mut indent,
@@ -1452,25 +1449,29 @@ impl<R: BufRead> Scanner<R> {
         let mut max_indent: i32 = 0;
         *end_mark = self.mark;
         loop {
-            self.cache(1)?;
-            while (*indent == 0 || (self.mark.column as i32) < *indent) && IS_SPACE!(self.buffer) {
+            self.input.lookahead(1);
+            while (*indent == 0 || (self.mark.column as i32) < *indent)
+                && self.input.next_char_is(' ')
+            {
                 self.skip_char();
-                self.cache(1)?;
+                self.input.lookahead(1);
             }
             if self.mark.column as i32 > max_indent {
                 max_indent = self.mark.column as i32;
             }
-            if (*indent == 0 || (self.mark.column as i32) < *indent) && IS_TAB!(self.buffer) {
+            if (*indent == 0 || (self.mark.column as i32) < *indent)
+                && self.input.next_char_is('\t')
+            {
                 return self.set_scanner_error(
                     "while scanning a block scalar",
                     start_mark,
                     "found a tab character where an indentation space is expected",
                 );
             }
-            if !IS_BREAK!(self.buffer) {
+            if !self.input.next_is_break() {
                 break;
             }
-            self.cache(2)?;
+            self.input.lookahead(2);
             self.read_line_break(breaks);
             *end_mark = self.mark;
         }
@@ -1496,49 +1497,58 @@ impl<R: BufRead> Scanner<R> {
         let start_mark: Mark = self.mark;
         self.skip_char();
         loop {
-            self.cache(4)?;
+            self.input.lookahead(4);
 
             if self.mark.column == 0
-                && (CHECK_AT!(self.buffer, '-', 0)
-                    && CHECK_AT!(self.buffer, '-', 1)
-                    && CHECK_AT!(self.buffer, '-', 2)
-                    || CHECK_AT!(self.buffer, '.', 0)
-                        && CHECK_AT!(self.buffer, '.', 1)
-                        && CHECK_AT!(self.buffer, '.', 2))
-                && IS_BLANKZ_AT!(self.buffer, 3)
+                && (self.input.nth_char_is(0, '-')
+                    && self.input.nth_char_is(1, '-')
+                    && self.input.nth_char_is(2, '-')
+                    || self.input.nth_char_is(0, '.')
+                        && self.input.nth_char_is(1, '.')
+                        && self.input.nth_char_is(2, '.'))
+                && is_blank_or_breakz(self.input.peek_nth(3))
             {
                 return self.set_scanner_error(
                     "while scanning a quoted scalar",
                     start_mark,
                     "found unexpected document indicator",
                 );
-            } else if IS_Z!(self.buffer) {
+            } else if self.input.next_is_z() {
                 return self.set_scanner_error(
                     "while scanning a quoted scalar",
                     start_mark,
                     "found unexpected end of stream",
                 );
             }
-            self.cache(2)?;
+            self.input.lookahead(2);
             leading_blanks = false;
-            while !IS_BLANKZ!(self.buffer) {
-                if single && CHECK_AT!(self.buffer, '\'', 0) && CHECK_AT!(self.buffer, '\'', 1) {
+            while !self.input.next_is_blank_or_breakz() {
+                if single
+                    && self.input.nth_char_is(0, '\'')
+                    && self.input.nth_char_is(1, '\'')
+                {
                     string.push('\'');
                     self.skip_char();
                     self.skip_char();
                 } else {
-                    if CHECK!(self.buffer, if single { '\'' } else { '"' }) {
+                    if self
+                        .input
+                        .next_char_is(if single { '\'' } else { '"' })
+                    {
                         break;
                     }
-                    if !single && CHECK!(self.buffer, '\\') && IS_BREAK_AT!(self.buffer, 1) {
-                        self.cache(3)?;
+                    if !single
+                        && self.input.next_char_is('\\')
+                        && is_break(self.input.peek_nth(1))
+                    {
+                        self.input.lookahead(3);
                         self.skip_char();
                         self.skip_line_break();
                         leading_blanks = true;
                         break;
-                    } else if !single && CHECK!(self.buffer, '\\') {
+                    } else if !single && self.input.next_char_is('\\') {
                         let mut code_length = 0usize;
-                        match self.buffer.get(1).copied().unwrap() {
+                        match self.input.peek_nth(1) {
                             '0' => {
                                 string.push('\0');
                             }
@@ -1585,22 +1595,14 @@ impl<R: BufRead> Scanner<R> {
                             // #xA0
                             '_' => {
                                 string.push('\u{00a0}');
-                                // string.push('\xC2');
-                                // string.push('\xA0');
                             }
                             // LS (#x2028)
                             'L' => {
                                 string.push('\u{2028}');
-                                // string.push('\xE2');
-                                // string.push('\x80');
-                                // string.push('\xA8');
                             }
                             // PS (#x2029)
                             'P' => {
                                 string.push('\u{2029}');
-                                // string.push('\xE2');
-                                // string.push('\x80');
-                                // string.push('\xA9');
                             }
                             'x' => {
                                 code_length = 2;
@@ -1624,16 +1626,16 @@ impl<R: BufRead> Scanner<R> {
                         if code_length != 0 {
                             let mut value: u32 = 0;
                             let mut k = 0;
-                            self.cache(code_length)?;
+                            self.input.lookahead(code_length);
                             while k < code_length {
-                                if !IS_HEX_AT!(self.buffer, k) {
+                                if !is_hex(self.input.peek_nth(k)) {
                                     return self.set_scanner_error(
                                         "while parsing a quoted scalar",
                                         start_mark,
                                         "did not find expected hexdecimal number",
                                     );
                                 }
-                                value = (value << 4) + AS_HEX_AT!(self.buffer, k);
+                                value = (value << 4) + as_hex(self.input.peek_nth(k));
                                 k += 1;
                             }
                             if let Some(ch) = char::from_u32(value) {
@@ -1656,22 +1658,25 @@ impl<R: BufRead> Scanner<R> {
                         self.read_char(&mut string);
                     }
                 }
-                self.cache(2)?;
+                self.input.lookahead(2);
             }
-            self.cache(1)?;
-            if CHECK!(self.buffer, if single { '\'' } else { '"' }) {
+            self.input.lookahead(1);
+            if self
+                .input
+                .next_char_is(if single { '\'' } else { '"' })
+            {
                 break;
             }
-            self.cache(1)?;
-            while IS_BLANK!(self.buffer) || IS_BREAK!(self.buffer) {
-                if IS_BLANK!(self.buffer) {
+            self.input.lookahead(1);
+            while self.input.next_is_blank() || self.input.next_is_break() {
+                if self.input.next_is_blank() {
                     if leading_blanks {
                         self.skip_char();
                     } else {
                         self.read_char(&mut whitespaces);
                     }
                 } else {
-                    self.cache(2)?;
+                    self.input.lookahead(2);
                     if leading_blanks {
                         self.read_line_break(&mut trailing_breaks);
                     } else {
@@ -1680,7 +1685,7 @@ impl<R: BufRead> Scanner<R> {
                         leading_blanks = true;
                     }
                 }
-                self.cache(1)?;
+                self.input.lookahead(1);
             }
             if leading_blanks {
                 if leading_break.starts_with('\n') {
@@ -1730,30 +1735,30 @@ impl<R: BufRead> Scanner<R> {
         end_mark = self.mark;
         let start_mark: Mark = end_mark;
         loop {
-            self.cache(4)?;
+            self.input.lookahead(4);
             if self.mark.column == 0
-                && (CHECK_AT!(self.buffer, '-', 0)
-                    && CHECK_AT!(self.buffer, '-', 1)
-                    && CHECK_AT!(self.buffer, '-', 2)
-                    || CHECK_AT!(self.buffer, '.', 0)
-                        && CHECK_AT!(self.buffer, '.', 1)
-                        && CHECK_AT!(self.buffer, '.', 2))
-                && IS_BLANKZ_AT!(self.buffer, 3)
+                && (self.input.nth_char_is(0, '-')
+                    && self.input.nth_char_is(1, '-')
+                    && self.input.nth_char_is(2, '-')
+                    || self.input.nth_char_is(0, '.')
+                        && self.input.nth_char_is(1, '.')
+                        && self.input.nth_char_is(2, '.'))
+                && is_blank_or_breakz(self.input.peek_nth(3))
             {
                 break;
             }
-            if CHECK!(self.buffer, '#') {
+            if self.input.next_char_is('#') {
                 break;
             }
-            while !IS_BLANKZ!(self.buffer) {
+            while !self.input.next_is_blank_or_breakz() {
                 if self.flow_level != 0
-                    && CHECK!(self.buffer, ':')
-                    && (CHECK_AT!(self.buffer, ',', 1)
-                        || CHECK_AT!(self.buffer, '?', 1)
-                        || CHECK_AT!(self.buffer, '[', 1)
-                        || CHECK_AT!(self.buffer, ']', 1)
-                        || CHECK_AT!(self.buffer, '{', 1)
-                        || CHECK_AT!(self.buffer, '}', 1))
+                    && self.input.next_char_is(':')
+                    && (self.input.nth_char_is(1, ',')
+                        || self.input.nth_char_is(1, '?')
+                        || self.input.nth_char_is(1, '[')
+                        || self.input.nth_char_is(1, ']')
+                        || self.input.nth_char_is(1, '{')
+                        || self.input.nth_char_is(1, '}'))
                 {
                     return self.set_scanner_error(
                         "while scanning a plain scalar",
@@ -1762,13 +1767,14 @@ impl<R: BufRead> Scanner<R> {
                     );
                 }
 
-                if CHECK!(self.buffer, ':') && IS_BLANKZ_AT!(self.buffer, 1)
+                if self.input.next_char_is(':')
+                    && is_blank_or_breakz(self.input.peek_nth(1))
                     || self.flow_level != 0
-                        && (CHECK!(self.buffer, ',')
-                            || CHECK!(self.buffer, '[')
-                            || CHECK!(self.buffer, ']')
-                            || CHECK!(self.buffer, '{')
-                            || CHECK!(self.buffer, '}'))
+                        && (self.input.next_char_is(',')
+                            || self.input.next_char_is('[')
+                            || self.input.next_char_is(']')
+                            || self.input.next_char_is('{')
+                            || self.input.next_char_is('}'))
                 {
                     break;
                 }
@@ -1796,16 +1802,18 @@ impl<R: BufRead> Scanner<R> {
                 }
                 self.read_char(&mut string);
                 end_mark = self.mark;
-                self.cache(2)?;
+                self.input.lookahead(2);
             }
-            if !(IS_BLANK!(self.buffer) || IS_BREAK!(self.buffer)) {
+            if !(self.input.next_is_blank() || self.input.next_is_break()) {
                 break;
             }
-            self.cache(1)?;
+            self.input.lookahead(1);
 
-            while IS_BLANK!(self.buffer) || IS_BREAK!(self.buffer) {
-                if IS_BLANK!(self.buffer) {
-                    if leading_blanks && (self.mark.column as i32) < indent && IS_TAB!(self.buffer)
+            while self.input.next_is_blank() || self.input.next_is_break() {
+                if self.input.next_is_blank() {
+                    if leading_blanks
+                        && (self.mark.column as i32) < indent
+                        && self.input.next_char_is('\t')
                     {
                         return self.set_scanner_error(
                             "while scanning a plain scalar",
@@ -1818,7 +1826,7 @@ impl<R: BufRead> Scanner<R> {
                         self.skip_char();
                     }
                 } else {
-                    self.cache(2)?;
+                    self.input.lookahead(2);
 
                     if leading_blanks {
                         self.read_line_break(&mut trailing_breaks);
@@ -1828,7 +1836,7 @@ impl<R: BufRead> Scanner<R> {
                         leading_blanks = true;
                     }
                 }
-                self.cache(1)?;
+                self.input.lookahead(1);
             }
             if self.flow_level == 0 && (self.mark.column as i32) < indent {
                 break;
@@ -1850,13 +1858,7 @@ impl<R: BufRead> Scanner<R> {
     }
 }
 
-impl<R> Default for Scanner<R> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<R: BufRead> Iterator for Scanner<R> {
+impl<I: Input> Iterator for Scanner<I> {
     type Item = Result<Token>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1868,4 +1870,4 @@ impl<R: BufRead> Iterator for Scanner<R> {
     }
 }
 
-impl<R: BufRead> core::iter::FusedIterator for Scanner<R> {}
+impl<I: Input> core::iter::FusedIterator for Scanner<I> {}

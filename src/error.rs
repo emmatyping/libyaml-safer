@@ -29,11 +29,6 @@ struct Problem {
 
 #[derive(Debug)]
 enum ErrorImpl {
-    Reader {
-        problem: &'static str,
-        offset: usize,
-        value: i32,
-    },
     Scanner(Problem),
     Parser(Problem),
     Composer(Problem),
@@ -61,14 +56,6 @@ impl From<std::io::Error> for Error {
 }
 
 impl Error {
-    pub(crate) fn reader(problem: &'static str, offset: usize, value: i32) -> Self {
-        Self(Box::new(ErrorImpl::Reader {
-            problem,
-            offset,
-            value,
-        }))
-    }
-
     pub(crate) fn scanner(
         context: &'static str,
         context_mark: Mark,
@@ -117,7 +104,6 @@ impl Error {
 
     pub fn kind(&self) -> ErrorKind {
         match &*self.0 {
-            ErrorImpl::Reader { .. } => ErrorKind::Reader,
             ErrorImpl::Scanner(_) => ErrorKind::Scanner,
             ErrorImpl::Parser(_) => ErrorKind::Parser,
             ErrorImpl::Composer(_) => ErrorKind::Composer,
@@ -128,7 +114,7 @@ impl Error {
 
     pub fn problem_mark(&self) -> Option<Mark> {
         match &*self.0 {
-            ErrorImpl::Reader { .. } | ErrorImpl::Emitter(_) | ErrorImpl::Io(_) => None,
+            ErrorImpl::Emitter(_) | ErrorImpl::Io(_) => None,
             ErrorImpl::Scanner(p) | ErrorImpl::Parser(p) | ErrorImpl::Composer(p) => {
                 Some(p.problem_mark)
             }
@@ -137,7 +123,7 @@ impl Error {
 
     pub fn context_mark(&self) -> Option<Mark> {
         match &*self.0 {
-            ErrorImpl::Reader { .. } | ErrorImpl::Emitter(..) | ErrorImpl::Io(_) => None,
+            ErrorImpl::Emitter(..) | ErrorImpl::Io(_) => None,
             ErrorImpl::Scanner(p) | ErrorImpl::Parser(p) | ErrorImpl::Composer(p) => {
                 if p.context.is_empty() {
                     None
@@ -150,7 +136,7 @@ impl Error {
 
     pub fn problem(&self) -> &'static str {
         match &*self.0 {
-            ErrorImpl::Reader { problem, .. } | ErrorImpl::Emitter(problem) => problem,
+            ErrorImpl::Emitter(problem) => problem,
             ErrorImpl::Scanner(p) | ErrorImpl::Parser(p) | ErrorImpl::Composer(p) => p.problem,
             ErrorImpl::Io(_) => "I/O error",
         }
@@ -158,7 +144,7 @@ impl Error {
 
     pub fn context(&self) -> Option<&'static str> {
         match &*self.0 {
-            ErrorImpl::Reader { .. } | ErrorImpl::Emitter(..) | ErrorImpl::Io(_) => None,
+            ErrorImpl::Emitter(..) | ErrorImpl::Io(_) => None,
             ErrorImpl::Scanner(p) | ErrorImpl::Parser(p) | ErrorImpl::Composer(p) => {
                 if p.context.is_empty() {
                     None
@@ -230,11 +216,6 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} error: ", self.kind())?;
         match *self.0 {
-            ErrorImpl::Reader {
-                problem,
-                offset,
-                value,
-            } => write!(f, "{problem} (offset {offset}, value {value})"),
             ErrorImpl::Scanner(ref p) | ErrorImpl::Parser(ref p) | ErrorImpl::Composer(ref p) => {
                 write!(f, "{p}")
             }

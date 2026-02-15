@@ -26,12 +26,13 @@ extern crate alloc;
 #[macro_use]
 mod macros;
 
+pub mod char_traits;
 mod document;
 mod emitter;
 mod error;
 mod event;
+pub mod input;
 mod parser;
-mod reader;
 mod scanner;
 mod token;
 
@@ -39,12 +40,10 @@ pub use crate::document::*;
 pub use crate::emitter::*;
 pub use crate::error::*;
 pub use crate::event::*;
+pub use crate::input::{BufferedInput, Input, OwnedStrInput, StrInput};
 pub use crate::parser::*;
 pub use crate::scanner::*;
 pub use crate::token::*;
-
-pub(crate) const INPUT_RAW_BUFFER_SIZE: usize = 16384;
-pub(crate) const INPUT_BUFFER_SIZE: usize = INPUT_RAW_BUFFER_SIZE;
 pub(crate) const OUTPUT_BUFFER_SIZE: usize = 16384;
 
 /// The tag `!!null` with the only possible value: `null`.
@@ -186,9 +185,7 @@ single: '"Howdy!" he cried.'
 quoted: ' # Not a ''comment''.'
 tie-fighter: '|\-*-/|'
 "#;
-        let mut parser = Parser::new();
-        let mut read_in = SANITY_INPUT.as_bytes();
-        parser.set_input_string(&mut read_in);
+        let mut parser = Parser::new(StrInput::new(SANITY_INPUT));
         let doc = Document::load(&mut parser).unwrap();
 
         let mut emitter = Emitter::new();
@@ -203,9 +200,7 @@ tie-fighter: '|\-*-/|'
     fn scanner_marks() {
         const INPUT: &str = "b:
 c: true";
-        let mut scanner = Scanner::new();
-        let mut read_in = INPUT.as_bytes();
-        scanner.set_input(&mut read_in);
+        let scanner = Scanner::new(StrInput::new(INPUT));
         let events = scanner.collect::<Result<Vec<_>, _>>().unwrap();
         let expected = &[
             Token {
