@@ -35,4 +35,4 @@ codegen-units = 1
 debug = true
 
 [dependencies]
-arraydeque = { version = "0.5.1", default-features = false }
+arraydeque = "0.5.1"
