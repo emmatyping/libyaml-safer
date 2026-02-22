@@ -28,3 +28,14 @@ rustdoc-args = ["--generate-link-to-definition"]
 [[bench]]
 name = "bench"
 harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.profile]
+inherits = "release"
+lto = false
+codegen-units = 1
+debug = "line-tables-only"
+frame-pointer = "always"
