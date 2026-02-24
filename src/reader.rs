@@ -14,36 +14,19 @@ fn yaml_parser_determine_encoding(reader: &mut dyn BufRead) -> Result<Option<Enc
         return Ok(None);
     }
 
-    match initial_bytes[0] {
-        0xef => {
-            let mut bom = [0; 3];
-            reader.read_exact(&mut bom)?;
-            if bom == BOM_UTF8 {
-                Ok(Some(Encoding::Utf8))
-            } else {
-                Err(Error::reader(
-                    "invalid byte order marker",
-                    0,
-                    i32::from_be_bytes([bom[0], bom[1], bom[2], 0]),
-                ))
-            }
-        }
-        0xff | 0xfe => {
-            let mut bom = [0; 2];
-            reader.read_exact(&mut bom)?;
-            if bom == BOM_UTF16LE {
-                Ok(Some(Encoding::Utf16Le))
-            } else if bom == BOM_UTF16BE {
-                Ok(Some(Encoding::Utf16Be))
-            } else {
-                Err(Error::reader(
-                    "invalid byte order marker",
-                    0,
-                    i32::from_le_bytes([bom[0], bom[1], 0, 0]),
-                ))
-            }
-        }
-        _ => Ok(Some(Encoding::Utf8)),
+    // Match the original C libyaml behavior: peek at initial bytes, consume
+    // only if a BOM is found, otherwise default to UTF-8.
+    if initial_bytes.len() >= 3 && initial_bytes[..3] == BOM_UTF8 {
+        reader.consume(3);
+        Ok(Some(Encoding::Utf8))
+    } else if initial_bytes.len() >= 2 && initial_bytes[..2] == BOM_UTF16LE {
+        reader.consume(2);
+        Ok(Some(Encoding::Utf16Le))
+    } else if initial_bytes.len() >= 2 && initial_bytes[..2] == BOM_UTF16BE {
+        reader.consume(2);
+        Ok(Some(Encoding::Utf16Be))
+    } else {
+        Ok(Some(Encoding::Utf8))
     }
 }
 

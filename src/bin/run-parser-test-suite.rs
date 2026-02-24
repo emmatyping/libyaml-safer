@@ -21,7 +21,7 @@ use std::slice;
 
 pub(crate) fn test_main(
     stdin: &mut dyn Read,
-    stdout: &mut dyn Write,
+    stdout: &mut (dyn Write + Send + Sync),
 ) -> Result<(), Box<dyn Error>> {
     let mut parser = Parser::new();
 

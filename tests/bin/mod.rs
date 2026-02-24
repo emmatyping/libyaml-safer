@@ -14,7 +14,7 @@ pub fn run(
     compiled: &str,
     unsafe_main: unsafe fn(
         stdin: &mut dyn Read,
-        stdout: &mut dyn Write,
+        stdout: &mut (dyn Write + Send + Sync),
     ) -> Result<(), Box<dyn Error>>,
     input: &Path,
 ) -> Output {
