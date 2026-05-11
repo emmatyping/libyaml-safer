@@ -1151,7 +1151,6 @@ impl<'w> Emitter<'w> {
         let mut trailing_break = false;
         let mut break_space = false;
         let mut space_break = false;
-        let mut preceded_by_whitespace;
         let mut previous_space = false;
         let mut previous_break = false;
 
@@ -1171,90 +1170,175 @@ impl<'w> Emitter<'w> {
             block_indicators = true;
             flow_indicators = true;
         }
-        preceded_by_whitespace = true;
+        // Treat "before the string starts" as whitespace
+        let mut preceded_by_whitespace = true;
 
-        let mut chars = value.chars();
+        // Byte-level loop with an ASCII fast path. The original char-iterator
+        // version paid a UTF-8 decode + Unicode-range pattern match per char,
+        // which `is_printable` + `chars.clone().next()` made the hottest
+        // function in the emitter. Almost all YAML scalars are ASCII; for ASCII
+        // bytes every check reduces to a single byte comparison. Multi-byte
+        // codepoints fall through to a slow path that decodes one char.
+        let bytes = value.as_bytes();
+        let len = bytes.len();
+        let allow_unicode = self.unicode;
+        let mut i = 0;
         let mut first = true;
 
-        while let Some(ch) = chars.next() {
-            let next = chars.clone().next();
-            let followed_by_whitespace = is_blankz(next);
-            if first {
-                match ch {
-                    '#' | ',' | '[' | ']' | '{' | '}' | '&' | '*' | '!' | '|' | '>' | '\''
-                    | '"' | '%' | '@' | '`' => {
-                        flow_indicators = true;
-                        block_indicators = true;
+        while i < len {
+            let b = bytes[i];
+
+            if b < 0x80 {
+                let next_pos = i + 1;
+                let at_end = next_pos >= len;
+                // `is_blankz` of the next codepoint. For ASCII next-byte this
+                // is direct; if the next byte is the lead of a multi-byte
+                // sequence, decode just that one char (U+0085, U+2028, U+2029
+                // are the only multi-byte codepoints for which is_blankz is
+                // true; this fallback handles them).
+                let followed_by_whitespace = if at_end {
+                    true
+                } else {
+                    let nb = bytes[next_pos];
+                    if nb < 0x80 {
+                        matches!(nb, b' ' | b'\t' | b'\r' | b'\n')
+                    } else {
+                        // SAFETY: bytes came from a &str, so all positions are
+                        // valid UTF-8 boundaries when interpreted as char start.
+                        is_blankz(value[next_pos..].chars().next())
                     }
-                    '?' | ':' => {
-                        flow_indicators = true;
-                        if followed_by_whitespace {
+                };
+
+                if first {
+                    match b {
+                        b'#' | b',' | b'[' | b']' | b'{' | b'}' | b'&' | b'*' | b'!' | b'|'
+                        | b'>' | b'\'' | b'"' | b'%' | b'@' | b'`' => {
+                            flow_indicators = true;
                             block_indicators = true;
                         }
-                    }
-                    '-' if followed_by_whitespace => {
-                        flow_indicators = true;
-                        block_indicators = true;
-                    }
-                    _ => {}
-                }
-            } else {
-                match ch {
-                    ',' | '?' | '[' | ']' | '{' | '}' => {
-                        flow_indicators = true;
-                    }
-                    ':' => {
-                        flow_indicators = true;
-                        if followed_by_whitespace {
+                        b'?' | b':' => {
+                            flow_indicators = true;
+                            if followed_by_whitespace {
+                                block_indicators = true;
+                            }
+                        }
+                        b'-' if followed_by_whitespace => {
+                            flow_indicators = true;
                             block_indicators = true;
                         }
+                        _ => {}
                     }
-                    '#' if preceded_by_whitespace => {
-                        flow_indicators = true;
-                        block_indicators = true;
+                } else {
+                    match b {
+                        b',' | b'?' | b'[' | b']' | b'{' | b'}' => {
+                            flow_indicators = true;
+                        }
+                        b':' => {
+                            flow_indicators = true;
+                            if followed_by_whitespace {
+                                block_indicators = true;
+                            }
+                        }
+                        b'#' if preceded_by_whitespace => {
+                            flow_indicators = true;
+                            block_indicators = true;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
 
-            if !is_printable(ch) || !is_ascii(ch) && !self.unicode {
-                special_characters = true;
-            }
-            if is_break(ch) {
-                line_breaks = true;
-            }
+                // is_printable for ASCII: \n (0x0a) or 0x20..=0x7e.
+                let printable = b == b'\n' || (b'\x20'..=b'\x7e').contains(&b);
+                if !printable {
+                    special_characters = true;
+                }
 
-            if is_space(ch) {
-                if first {
-                    leading_space = true;
+                // ASCII line break: LF or CR.
+                let is_br = b == b'\n' || b == b'\r';
+                if is_br {
+                    line_breaks = true;
                 }
-                if next.is_none() {
-                    trailing_space = true;
+
+                if b == b' ' {
+                    if first {
+                        leading_space = true;
+                    }
+                    if at_end {
+                        trailing_space = true;
+                    }
+                    if previous_break {
+                        break_space = true;
+                    }
+                    previous_space = true;
+                    previous_break = false;
+                } else if is_br {
+                    if first {
+                        leading_break = true;
+                    }
+                    if at_end {
+                        trailing_break = true;
+                    }
+                    if previous_space {
+                        space_break = true;
+                    }
+                    previous_space = false;
+                    previous_break = true;
+                } else {
+                    previous_space = false;
+                    previous_break = false;
                 }
-                if previous_break {
-                    break_space = true;
-                }
-                previous_space = true;
-                previous_break = false;
-            } else if is_break(ch) {
-                if first {
-                    leading_break = true;
-                }
-                if next.is_none() {
-                    trailing_break = true;
-                }
-                if previous_space {
-                    space_break = true;
-                }
-                previous_space = false;
-                previous_break = true;
+
+                // preceded_by_whitespace for next iter is is_blankz(this).
+                // ASCII: space, tab, CR, LF. (NUL is not in a valid &str.)
+                preceded_by_whitespace = matches!(b, b' ' | b'\t' | b'\r' | b'\n');
+                first = false;
+                i = next_pos;
             } else {
-                previous_space = false;
-                previous_break = false;
-            }
+                let ch = value[i..].chars().next().expect("non-empty &str slice");
+                let ch_len = ch.len_utf8();
+                let next_pos = i + ch_len;
+                let next = if next_pos >= len {
+                    None
+                } else {
+                    value[next_pos..].chars().next()
+                };
 
-            preceded_by_whitespace = is_blankz(ch);
-            first = false;
+                // None of the first-position or mid-string indicators are
+                // multi-byte codepoints, so no indicator checks for ch >= 0x80.
+                // (followed_by_whitespace would only feed those checks.)
+
+                if !is_printable(ch) || !allow_unicode {
+                    special_characters = true;
+                }
+
+                let is_br = is_break(ch);
+                if is_br {
+                    line_breaks = true;
+                }
+
+                if is_br {
+                    if first {
+                        leading_break = true;
+                    }
+                    if next.is_none() {
+                        trailing_break = true;
+                    }
+                    if previous_space {
+                        space_break = true;
+                    }
+                    previous_space = false;
+                    previous_break = true;
+                } else {
+                    previous_space = false;
+                    previous_break = false;
+                }
+
+                // is_blankz(ch) for non-ASCII char: only true for U+0085,
+                // U+2028, U+2029 (all break chars).
+                preceded_by_whitespace = is_br;
+                first = false;
+                i = next_pos;
+            }
         }
 
         let mut analysis = ScalarAnalysis {
@@ -1267,11 +1351,6 @@ impl<'w> Emitter<'w> {
             style: ScalarStyle::Any,
         };
 
-        analysis.multiline = line_breaks;
-        analysis.flow_plain_allowed = true;
-        analysis.block_plain_allowed = true;
-        analysis.single_quoted_allowed = true;
-        analysis.block_allowed = true;
         if leading_space || leading_break || trailing_space || trailing_break {
             analysis.flow_plain_allowed = false;
             analysis.block_plain_allowed = false;
@@ -1458,10 +1537,68 @@ impl<'w> Emitter<'w> {
             self.put(' ')?;
         }
 
-        let mut chars = value.chars();
+        // Byte-level loop with batched runs of "ordinary" ASCII bytes (not
+        // space, not break, not multi-byte UTF-8 lead). These bytes do not
+        // trigger line wrap, indent, or state changes -- they just advance the
+        // column and append to the buffer, so a run can be emitted as a single
+        // push_str.
+        let bytes = value.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
 
-        while let Some(ch) = chars.next() {
-            let next = chars.clone().next();
+        while i < len {
+            let b = bytes[i];
+
+            // Ordinary-byte fast path: ASCII, not space (0x20), tab (0x09), CR,
+            // or LF. Multi-byte UTF-8 sequences (>=0x80) fall through; the
+            // codepoints U+0085, U+2028, U+2029 (multi-byte break chars) are
+            // handled by the slow path so their break logic runs.
+            if b > 0x20 && b < 0x7f {
+                let start = i;
+                i += 1;
+                while i < len {
+                    let bb = bytes[i];
+                    if !(bb > 0x20 && bb < 0x7f) {
+                        break;
+                    }
+                    i += 1;
+                }
+                if breaks {
+                    self.write_indent()?;
+                }
+                let chunk = &value[start..i];
+                if self.buffer.len() + chunk.len() > OUTPUT_BUFFER_SIZE {
+                    self.flush()?;
+                }
+                self.buffer.reserve(chunk.len());
+                self.column += chunk.len() as i32;
+                self.buffer.push_str(chunk);
+                self.indention = false;
+                spaces = false;
+                breaks = false;
+                continue;
+            }
+
+            // Slow path: decode one char and replicate original semantics.
+            let (ch, ch_len) = if b < 0x80 {
+                (b as char, 1usize)
+            } else {
+                let c = value[i..]
+                    .chars()
+                    .next()
+                    .expect("non-empty &str slice always yields a char");
+                (c, c.len_utf8())
+            };
+
+            let next_pos = i + ch_len;
+            let next = if next_pos >= len {
+                None
+            } else if bytes[next_pos] < 0x80 {
+                Some(bytes[next_pos] as char)
+            } else {
+                value[next_pos..].chars().next()
+            };
+
             if is_space(ch) {
                 if allow_breaks && !spaces && self.column > self.best_width && !is_space(next) {
                     self.write_indent()?;
@@ -1485,6 +1622,7 @@ impl<'w> Emitter<'w> {
                 spaces = false;
                 breaks = false;
             }
+            i += ch_len;
         }
         self.whitespace = false;
         self.indention = false;
@@ -1495,11 +1633,64 @@ impl<'w> Emitter<'w> {
         let mut spaces = false;
         let mut breaks = false;
         self.write_indicator("'", true, false, false)?;
-        let mut chars = value.chars();
+
+        // Batched byte-level loop. "Ordinary" = printable ASCII (0x21..=0x7e)
+        // other than `'`. Such bytes never trigger line wrap, indent change,
+        // quote doubling, or any state change other than column advance.
+        let bytes = value.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
         let mut is_first = true;
-        while let Some(ch) = chars.next() {
-            let next = chars.clone().next();
-            let is_last = next.is_none();
+
+        while i < len {
+            let b = bytes[i];
+
+            if (0x21..=0x7e).contains(&b) && b != b'\'' {
+                let start = i;
+                i += 1;
+                while i < len {
+                    let bb = bytes[i];
+                    if !((0x21..=0x7e).contains(&bb) && bb != b'\'') {
+                        break;
+                    }
+                    i += 1;
+                }
+                if breaks {
+                    self.write_indent()?;
+                }
+                let chunk = &value[start..i];
+                if self.buffer.len() + chunk.len() > OUTPUT_BUFFER_SIZE {
+                    self.flush()?;
+                }
+                self.buffer.reserve(chunk.len());
+                self.column += chunk.len() as i32;
+                self.buffer.push_str(chunk);
+                self.indention = false;
+                spaces = false;
+                breaks = false;
+                is_first = false;
+                continue;
+            }
+
+            let (ch, ch_len) = if b < 0x80 {
+                (b as char, 1usize)
+            } else {
+                let c = value[i..]
+                    .chars()
+                    .next()
+                    .expect("non-empty &str slice always yields a char");
+                (c, c.len_utf8())
+            };
+
+            let next_pos = i + ch_len;
+            let is_last = next_pos >= len;
+            let next = if is_last {
+                None
+            } else if bytes[next_pos] < 0x80 {
+                Some(bytes[next_pos] as char)
+            } else {
+                value[next_pos..].chars().next()
+            };
 
             if is_space(ch) {
                 if allow_breaks
@@ -1535,6 +1726,7 @@ impl<'w> Emitter<'w> {
             }
 
             is_first = false;
+            i += ch_len;
         }
         if breaks {
             self.write_indent()?;
@@ -1548,9 +1740,60 @@ impl<'w> Emitter<'w> {
     fn write_double_quoted_scalar(&mut self, value: &str, allow_breaks: bool) -> Result<()> {
         let mut spaces = false;
         self.write_indicator("\"", true, false, false)?;
-        let mut chars = value.chars();
+
+        // Byte-level loop with batched runs of "safe" ASCII bytes. The original
+        // char-iterator version produced one `write_char` + `flush_if_needed`
+        // per byte, which dominated the profile after S1. A "safe" byte is
+        // printable ASCII (0x21..=0x7e) other than `"` or `\` -- safe for plain
+        // emission without escaping. Long runs of these are written via a
+        // single push_str.
+        let bytes = value.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
         let mut first = true;
-        while let Some(ch) = chars.next() {
+
+        while i < len {
+            let b = bytes[i];
+
+            // Fast path: batch a run of printable ASCII bytes that need no
+            // escaping. Excludes 0x20 (space, has wrap logic), 0x22 ("), 0x5c
+            // (\). The lower bound 0x21 also excludes all non-printable ASCII.
+            if (0x21..=0x7e).contains(&b) && b != b'"' && b != b'\\' {
+                let start = i;
+                i += 1;
+                while i < len {
+                    let bb = bytes[i];
+                    if !((0x21..=0x7e).contains(&bb) && bb != b'"' && bb != b'\\') {
+                        break;
+                    }
+                    i += 1;
+                }
+                // start..i bytes are all ASCII (<0x80), so the indices are at
+                // valid char boundaries of `value`; slicing is safe.
+                let chunk = &value[start..i];
+                if self.buffer.len() + chunk.len() > OUTPUT_BUFFER_SIZE {
+                    self.flush()?;
+                }
+                self.buffer.reserve(chunk.len());
+                // Pure ASCII run: column advances by exactly chunk.len().
+                self.column += chunk.len() as i32;
+                self.buffer.push_str(chunk);
+                spaces = false;
+                first = false;
+                continue;
+            }
+
+            // Slow path. Decode one char and replicate the original semantics.
+            let (ch, ch_len) = if b < 0x80 {
+                (b as char, 1usize)
+            } else {
+                let c = value[i..]
+                    .chars()
+                    .next()
+                    .expect("non-empty &str slice always yields a char");
+                (c, c.len_utf8())
+            };
+
             if !is_printable(ch)
                 || !self.unicode && !is_ascii(ch)
                 || is_bom(ch)
@@ -1560,7 +1803,6 @@ impl<'w> Emitter<'w> {
             {
                 self.put('\\')?;
                 match ch {
-                    // TODO: Double check these character mappings.
                     '\0' => {
                         self.put('0')?;
                     }
@@ -1623,7 +1865,7 @@ impl<'w> Emitter<'w> {
                                 Some(digit_char) => digit_char,
                                 None => unreachable!("digit out of range"),
                             };
-                            // The libyaml emitter encodes unicode sequences as uppercase hex.
+                            // libyaml emits unicode sequences as uppercase hex.
                             let digit_char = digit_char.to_ascii_uppercase();
                             self.put(digit_char)?;
                             k -= 4;
@@ -1631,15 +1873,26 @@ impl<'w> Emitter<'w> {
                     }
                 }
                 spaces = false;
-            } else if is_space(ch) {
+            } else if ch == ' ' {
+                // Space: needs lookahead for wrap/line-continuation logic.
+                let next_pos = i + ch_len;
+                let next = if next_pos < len {
+                    if bytes[next_pos] < 0x80 {
+                        Some(bytes[next_pos] as char)
+                    } else {
+                        value[next_pos..].chars().next()
+                    }
+                } else {
+                    None
+                };
                 if allow_breaks
                     && !spaces
                     && self.column > self.best_width
                     && !first
-                    && chars.clone().next().is_some()
+                    && next.is_some()
                 {
                     self.write_indent()?;
-                    if is_space(chars.clone().next()) {
+                    if is_space(next) {
                         self.put('\\')?;
                     }
                 } else {
@@ -1652,7 +1905,9 @@ impl<'w> Emitter<'w> {
             }
 
             first = false;
+            i += ch_len;
         }
+
         self.write_indicator("\"", false, false, false)?;
         self.whitespace = false;
         self.indention = false;
