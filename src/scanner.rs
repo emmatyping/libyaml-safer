@@ -124,12 +124,10 @@ impl<R: BufRead> Scanner<R> {
 
     /// Equivalent to the libyaml macro `SKIP`.
     fn skip_char(&mut self) -> Result<()> {
-        let popped = self
-            .buffer
+        self.buffer
             .pop_front()
             .ok_or_else(|| Error::scanner("", self.mark, "unexpected end of input", self.mark))?;
-        let width = popped.len_utf8();
-        self.mark.index += width as u64;
+        self.mark.index += 1;
         self.mark.column += 1;
         Ok(())
     }
@@ -143,8 +141,7 @@ impl<R: BufRead> Scanner<R> {
                 self.mark.line += 1;
                 self.buffer.drain(0..2);
             } else if is_break(front) {
-                let width = front.len_utf8();
-                self.mark.index += width as u64;
+                self.mark.index += 1;
                 self.mark.column = 0;
                 self.mark.line += 1;
                 self.buffer.pop_front();
@@ -159,7 +156,7 @@ impl<R: BufRead> Scanner<R> {
             .pop_front()
             .ok_or_else(|| Error::scanner("", self.mark, "unexpected end of input", self.mark))?;
         string.push(popped);
-        self.mark.index += popped.len_utf8() as u64;
+        self.mark.index += 1;
         self.mark.column += 1;
         Ok(())
     }
@@ -187,7 +184,7 @@ impl<R: BufRead> Scanner<R> {
             } else {
                 string.push('\n');
             }
-            self.mark.index += char_len as u64;
+            self.mark.index += 1;
             self.mark.column = 0;
             self.mark.line += 1;
         }
