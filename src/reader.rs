@@ -1,6 +1,5 @@
+use crate::buffer::CharBuffer;
 use std::io::BufRead;
-
-use alloc::collections::VecDeque;
 
 use crate::{scanner::Scanner, Encoding, Error, Result};
 
@@ -35,7 +34,7 @@ fn yaml_parser_determine_encoding(reader: &mut dyn BufRead) -> Result<Option<Enc
 #[allow(unsafe_code)]
 fn read_utf8_buffered(
     reader: &mut dyn BufRead,
-    out: &mut VecDeque<char>,
+    out: &mut CharBuffer,
     offset: &mut usize,
 ) -> Result<bool> {
     let available = loop {
@@ -98,7 +97,7 @@ fn read_utf8_buffered(
 
 fn read_utf8_char_unbuffered(
     reader: &mut dyn BufRead,
-    out: &mut VecDeque<char>,
+    out: &mut CharBuffer,
     initial: u8,
     offset: &mut usize,
 ) -> Result<()> {
@@ -123,7 +122,7 @@ fn read_utf8_char_unbuffered(
 
 fn read_utf16_buffered<const BIG_ENDIAN: bool>(
     reader: &mut dyn BufRead,
-    out: &mut VecDeque<char>,
+    out: &mut CharBuffer,
     offset: &mut usize,
 ) -> Result<bool> {
     let available = loop {
@@ -181,7 +180,7 @@ fn read_utf16_buffered<const BIG_ENDIAN: bool>(
 
 fn read_utf16_char_unbuffered<const BIG_ENDIAN: bool>(
     reader: &mut dyn BufRead,
-    out: &mut VecDeque<char>,
+    out: &mut CharBuffer,
     offset: &mut usize,
 ) -> Result<()> {
     let mut buffer = [0; 2];
@@ -255,29 +254,34 @@ fn is_allowed(ch: char) -> bool {
 }
 
 /// `push_char` for each character of `valid`, advancing `offset`: every
-/// character before the first one that is not allowed is pushed. Runs of
-/// allowed ASCII are pushed in bulk.
-fn push_str(out: &mut VecDeque<char>, valid: &str, offset: &mut usize) -> Result<()> {
+/// character before the first one that is not allowed is pushed.
+fn push_str(out: &mut CharBuffer, valid: &str, offset: &mut usize) -> Result<()> {
     let bytes = valid.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let run = bytes[i..]
-            .iter()
-            .position(|&b| !(b.is_ascii() && is_allowed(char::from(b))))
-            .unwrap_or(bytes.len() - i);
-        out.extend(bytes[i..i + run].iter().map(|&b| char::from(b)));
-        i += run;
-        *offset += run;
-        if let Some(ch) = valid[i..].chars().next() {
-            push_char(out, ch, *offset)?;
-            i += ch.len_utf8();
-            *offset += ch.len_utf8();
+    // Printable ASCII, tabs and line breaks are allowed.
+    let ascii = bytes
+        .iter()
+        .position(|&b| !(b >= 0x20 && b < 0x7f || b == b'\t' || b == b'\n' || b == b'\r'))
+        .unwrap_or(bytes.len());
+    let mut chars = ascii;
+    for (index, ch) in valid[ascii..].char_indices() {
+        let index = ascii + index;
+        if !is_allowed(ch) {
+            out.push_str(&valid[..index], chars);
+            *offset += index;
+            return Err(Error::reader(
+                "control characters are not allowed",
+                *offset,
+                ch as _,
+            ));
         }
+        chars += 1;
     }
+    out.push_str(valid, chars);
+    *offset += valid.len();
     Ok(())
 }
 
-fn push_char(out: &mut VecDeque<char>, ch: char, offset: usize) -> Result<()> {
+fn push_char(out: &mut CharBuffer, ch: char, offset: usize) -> Result<()> {
     if !is_allowed(ch) {
         return Err(Error::reader(
             "control characters are not allowed",

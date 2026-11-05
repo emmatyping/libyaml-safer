@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::io::BufRead;
 
+use crate::buffer::CharBuffer;
 use crate::macros::{is_blank, is_blankz, is_break};
 use crate::reader::yaml_parser_update_buffer;
 use crate::{
@@ -21,7 +22,7 @@ pub struct Scanner<R> {
     /// The working buffer.
     ///
     /// This always contains valid UTF-8.
-    pub(crate) buffer: VecDeque<char>,
+    pub(crate) buffer: CharBuffer,
     /// The input encoding.
     pub(crate) encoding: Encoding,
     /// The offset of the current position (in bytes).
@@ -48,6 +49,17 @@ pub struct Scanner<R> {
     pub(crate) simple_key_allowed: bool,
     /// The stack of simple keys.
     pub(crate) simple_keys: Vec<SimpleKey>,
+    /// Strings reused while scanning scalars.
+    scratch: Scratch,
+}
+
+/// Working strings for scanning scalars, kept to reuse their allocations.
+#[derive(Default)]
+struct Scratch {
+    string: String,
+    leading_break: String,
+    trailing_breaks: String,
+    whitespaces: String,
 }
 
 impl<'r, 'b> Scanner<&'r mut &'b [u8]> {
@@ -63,7 +75,7 @@ impl<R> Scanner<R> {
         Self {
             read_handler: None,
             eof: false,
-            buffer: VecDeque::with_capacity(INPUT_BUFFER_SIZE),
+            buffer: CharBuffer::with_capacity(INPUT_BUFFER_SIZE),
             encoding: Encoding::Any,
             offset: 0,
             mark: Mark::default(),
@@ -77,6 +89,7 @@ impl<R> Scanner<R> {
             indent: 0,
             simple_key_allowed: false,
             simple_keys: Vec::with_capacity(16),
+            scratch: Scratch::default(),
         }
     }
 
@@ -134,12 +147,12 @@ impl<R: BufRead> Scanner<R> {
 
     /// Equivalent to the libyaml macro `SKIP_LINE`.
     fn skip_line_break(&mut self) {
-        if let Some(front) = self.buffer.front().copied() {
-            if let ('\r', Some('\n')) = (front, self.buffer.get(1).copied()) {
+        if let Some(front) = self.buffer.front() {
+            if let ('\r', Some('\n')) = (front, self.buffer.get(1)) {
                 self.mark.index += 2;
                 self.mark.column = 0;
                 self.mark.line += 1;
-                self.buffer.drain(0..2);
+                self.buffer.skip(2);
             } else if is_break(front) {
                 self.mark.index += 1;
                 self.mark.column = 0;
@@ -168,51 +181,31 @@ impl<R: BufRead> Scanner<R> {
     /// (and any decoding error raised) at the same point as without this.
     fn read_run(&mut self, string: &mut String, lookahead: usize, ordinary: impl Fn(char) -> bool) {
         let max = self.buffer.len().saturating_sub(lookahead);
-        let (front, back) = self.buffer.as_slices();
-        let mut n = front
-            .iter()
-            .take(max)
-            .take_while(|&&ch| ordinary(ch))
-            .count();
-        if n == front.len() && n < max {
-            n += back
-                .iter()
-                .take(max - n)
-                .take_while(|&&ch| ordinary(ch))
-                .count();
-        }
-        if n == 0 {
-            return;
-        }
-        string.extend(self.buffer.drain(..n));
-        self.mark.index += n as u64;
-        self.mark.column += n as u64;
+        let run = self.buffer.run(max, ordinary);
+        self.buffer.take_run(run, string);
+        self.mark.index += run.chars as u64;
+        self.mark.column += run.chars as u64;
     }
 
     /// `read_run` for characters that are skipped rather than read.
     fn skip_run(&mut self, lookahead: usize, ordinary: impl Fn(char) -> bool) {
         let max = self.buffer.len().saturating_sub(lookahead);
-        let n = self
-            .buffer
-            .iter()
-            .take(max)
-            .take_while(|&&ch| ordinary(ch))
-            .count();
-        self.buffer.drain(..n);
-        self.mark.index += n as u64;
-        self.mark.column += n as u64;
+        let run = self.buffer.run(max, ordinary);
+        self.buffer.skip_run(run);
+        self.mark.index += run.chars as u64;
+        self.mark.column += run.chars as u64;
     }
 
     /// Equivalent to the libyaml macro `READ_LINE`.
     fn read_line_break(&mut self, string: &mut String) -> Result<()> {
-        let front =
-            self.buffer.front().copied().ok_or_else(|| {
-                Error::scanner("", self.mark, "unexpected end of input", self.mark)
-            })?;
+        let front = self
+            .buffer
+            .front()
+            .ok_or_else(|| Error::scanner("", self.mark, "unexpected end of input", self.mark))?;
 
-        if let ('\r', Some('\n')) = (front, self.buffer.get(1).copied()) {
+        if let ('\r', Some('\n')) = (front, self.buffer.get(1)) {
             string.push('\n');
-            self.buffer.drain(0..2);
+            self.buffer.skip(2);
             self.mark.index += 2;
             self.mark.column = 0;
             self.mark.line += 1;
@@ -359,14 +352,14 @@ impl<R: BufRead> Scanner<R> {
         if IS_Z!(self.buffer) {
             return self.fetch_stream_end();
         }
-        if self.mark.column == 0_u64 && self.buffer[0] == '%' {
+        if self.mark.column == 0_u64 && self.buffer.get(0) == Some('%') {
             return self.fetch_directive();
         }
         if self.mark.column == 0_u64
             && CHECK_AT!(self.buffer, '-', 0)
             && CHECK_AT!(self.buffer, '-', 1)
             && CHECK_AT!(self.buffer, '-', 2)
-            && is_blankz(self.buffer.get(3).copied())
+            && is_blankz(self.buffer.get(3))
         {
             return self.fetch_document_indicator(TokenData::DocumentStart);
         }
@@ -374,7 +367,7 @@ impl<R: BufRead> Scanner<R> {
             && CHECK_AT!(self.buffer, '.', 0)
             && CHECK_AT!(self.buffer, '.', 1)
             && CHECK_AT!(self.buffer, '.', 2)
-            && is_blankz(self.buffer.get(3).copied())
+            && is_blankz(self.buffer.get(3))
         {
             return self.fetch_document_indicator(TokenData::DocumentEnd);
         }
@@ -1345,9 +1338,12 @@ impl<R: BufRead> Scanner<R> {
 
     fn scan_block_scalar(&mut self, literal: bool) -> Result<Token> {
         let mut end_mark: Mark;
-        let mut string = String::new();
-        let mut leading_break = String::new();
-        let mut trailing_breaks = String::new();
+        let mut string = core::mem::take(&mut self.scratch.string);
+        string.clear();
+        let mut leading_break = core::mem::take(&mut self.scratch.leading_break);
+        leading_break.clear();
+        let mut trailing_breaks = core::mem::take(&mut self.scratch.trailing_breaks);
+        trailing_breaks.clear();
         let mut chomping: i32 = 0;
         let mut increment: i32 = 0;
         let mut indent: i32 = 0;
@@ -1486,9 +1482,14 @@ impl<R: BufRead> Scanner<R> {
             string.push_str(&trailing_breaks);
         }
 
+        // Exactly sized: the scratch strings keep their capacity.
+        let value = String::from(string.as_str());
+        self.scratch.string = string;
+        self.scratch.leading_break = leading_break;
+        self.scratch.trailing_breaks = trailing_breaks;
         Ok(Token {
             data: TokenData::Scalar {
-                value: string,
+                value,
                 style: if literal {
                     ScalarStyle::Literal
                 } else {
@@ -1545,10 +1546,14 @@ impl<R: BufRead> Scanner<R> {
     }
 
     fn scan_flow_scalar(&mut self, single: bool) -> Result<Token> {
-        let mut string = String::new();
-        let mut leading_break = String::new();
-        let mut trailing_breaks = String::new();
-        let mut whitespaces = String::new();
+        let mut string = core::mem::take(&mut self.scratch.string);
+        string.clear();
+        let mut leading_break = core::mem::take(&mut self.scratch.leading_break);
+        leading_break.clear();
+        let mut trailing_breaks = core::mem::take(&mut self.scratch.trailing_breaks);
+        trailing_breaks.clear();
+        let mut whitespaces = core::mem::take(&mut self.scratch.whitespaces);
+        whitespaces.clear();
         let mut leading_blanks;
 
         let start_mark: Mark = self.mark;
@@ -1596,7 +1601,7 @@ impl<R: BufRead> Scanner<R> {
                         break;
                     } else if !single && CHECK!(self.buffer, '\\') {
                         let mut code_length = 0usize;
-                        let next_char = match self.buffer.get(1).copied() {
+                        let next_char = match self.buffer.get(1) {
                             Some(ch) => ch,
                             None => {
                                 return self.set_scanner_error(
@@ -1778,9 +1783,15 @@ impl<R: BufRead> Scanner<R> {
 
         self.skip_char()?;
         let end_mark: Mark = self.mark;
+        // Exactly sized: the scratch strings keep their capacity.
+        let value = String::from(string.as_str());
+        self.scratch.string = string;
+        self.scratch.leading_break = leading_break;
+        self.scratch.trailing_breaks = trailing_breaks;
+        self.scratch.whitespaces = whitespaces;
         Ok(Token {
             data: TokenData::Scalar {
-                value: string,
+                value,
                 style: if single {
                     ScalarStyle::SingleQuoted
                 } else {
@@ -1794,10 +1805,14 @@ impl<R: BufRead> Scanner<R> {
 
     fn scan_plain_scalar(&mut self) -> Result<Token> {
         let mut end_mark: Mark;
-        let mut string = String::new();
-        let mut leading_break = String::new();
-        let mut trailing_breaks = String::new();
-        let mut whitespaces = String::new();
+        let mut string = core::mem::take(&mut self.scratch.string);
+        string.clear();
+        let mut leading_break = core::mem::take(&mut self.scratch.leading_break);
+        leading_break.clear();
+        let mut trailing_breaks = core::mem::take(&mut self.scratch.trailing_breaks);
+        trailing_breaks.clear();
+        let mut whitespaces = core::mem::take(&mut self.scratch.whitespaces);
+        whitespaces.clear();
         let mut leading_blanks = false;
         let indent: i32 = self.indent + 1;
         end_mark = self.mark;
@@ -1921,9 +1936,15 @@ impl<R: BufRead> Scanner<R> {
             self.simple_key_allowed = true;
         }
 
+        // Exactly sized: the scratch strings keep their capacity.
+        let value = String::from(string.as_str());
+        self.scratch.string = string;
+        self.scratch.leading_break = leading_break;
+        self.scratch.trailing_breaks = trailing_breaks;
+        self.scratch.whitespaces = whitespaces;
         Ok(Token {
             data: TokenData::Scalar {
-                value: string,
+                value,
                 style: ScalarStyle::Plain,
             },
             start_mark,
