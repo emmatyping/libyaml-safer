@@ -216,3 +216,70 @@ fn utf8_width(lead: u8) -> usize {
         _ => 4,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buffer(text: &str) -> CharBuffer {
+        let mut buffer = CharBuffer::with_capacity(0);
+        buffer.push_str(text, text.chars().count());
+        buffer
+    }
+
+    #[test]
+    fn get_counts_characters() {
+        let buffer = buffer("aé中𝄞b");
+        assert_eq!(buffer.len(), 5);
+        let chars: Vec<_> = (0..6).map(|i| buffer.get(i)).collect();
+        assert_eq!(
+            chars,
+            [Some('a'), Some('é'), Some('中'), Some('𝄞'), Some('b'), None]
+        );
+    }
+
+    #[test]
+    fn pop_skip_and_take() {
+        let mut buffer = buffer("é中ab𝄞c");
+        assert_eq!(buffer.pop_front(), Some('é'));
+        buffer.skip(2);
+        assert_eq!(buffer.front(), Some('b'));
+        let run = buffer.run(usize::MAX, |ch| ch != 'c');
+        assert_eq!(run.chars, 2);
+        let mut taken = String::new();
+        buffer.take_run(run, &mut taken);
+        assert_eq!(taken, "b𝄞");
+        assert_eq!((buffer.len(), buffer.front()), (1, Some('c')));
+    }
+
+    #[test]
+    fn run_stops_at_max() {
+        let buffer = buffer("中中中中");
+        assert_eq!(buffer.run(2, |_| true).chars, 2);
+    }
+
+    #[test]
+    fn run_words_never_ends_in_blanks() {
+        let words = |text: &str, max: usize| {
+            let mut buffer = buffer(text);
+            let run = buffer.run_words(max, |ch| ch.is_alphanumeric(), |ch| ch != '#');
+            let mut taken = String::new();
+            buffer.take_run(run, &mut taken);
+            taken
+        };
+        assert_eq!(words("ab cd\t é  ;", usize::MAX), "ab cd\t é");
+        assert_eq!(words("ab  #cd", usize::MAX), "ab");
+        assert_eq!(words("ab cd", 4), "ab c");
+        assert_eq!(words("ab cd", 3), "ab");
+        assert_eq!(words("ab   ", usize::MAX), "ab");
+    }
+
+    #[test]
+    fn compacts_consumed_text() {
+        let mut buffer = buffer("abcd");
+        buffer.skip(3);
+        buffer.push_str("é", 1);
+        assert_eq!(buffer.pos, 0);
+        assert_eq!((buffer.get(0), buffer.get(1)), (Some('d'), Some('é')));
+    }
+}
