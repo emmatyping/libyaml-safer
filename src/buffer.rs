@@ -126,11 +126,13 @@ impl CharBuffer {
 
     /// Like `run`, but the run may also contain spaces and tabs between
     /// `ordinary` characters, where the character after the blanks also
-    /// passes `after_blanks`. It never ends in blanks.
+    /// passes `after_blanks` and is at most `max_word_start` characters from
+    /// the front. It never ends in blanks.
     #[inline]
     pub(crate) fn run_words(
         &self,
         max: usize,
+        max_word_start: usize,
         ordinary: impl Fn(char) -> bool,
         after_blanks: impl Fn(char) -> bool,
     ) -> Run {
@@ -144,7 +146,8 @@ impl CharBuffer {
             };
             if ch == ' ' || ch == '\t' {
                 blanks = true;
-            } else if ordinary(ch) && (!blanks || after_blanks(ch)) {
+            } else if ordinary(ch) && (!blanks || (end.chars <= max_word_start && after_blanks(ch)))
+            {
                 blanks = false;
             } else {
                 break;
@@ -262,7 +265,7 @@ mod tests {
     fn run_words_never_ends_in_blanks() {
         let words = |text: &str, max: usize| {
             let mut buffer = buffer(text);
-            let run = buffer.run_words(max, |ch| ch.is_alphanumeric(), |ch| ch != '#');
+            let run = buffer.run_words(max, usize::MAX, |ch| ch.is_alphanumeric(), |ch| ch != '#');
             let mut taken = String::new();
             buffer.take_run(run, &mut taken);
             taken
@@ -272,6 +275,15 @@ mod tests {
         assert_eq!(words("ab cd", 4), "ab c");
         assert_eq!(words("ab cd", 3), "ab");
         assert_eq!(words("ab   ", usize::MAX), "ab");
+    }
+
+    #[test]
+    fn run_words_limits_where_words_start() {
+        let buffer = buffer("ab cd ef");
+        let run = buffer.run_words(usize::MAX, 3, |ch| ch.is_alphabetic(), |_| true);
+        assert_eq!(run.chars, 5);
+        let run = buffer.run_words(usize::MAX, 2, |ch| ch.is_alphabetic(), |_| true);
+        assert_eq!(run.chars, 2);
     }
 
     #[test]

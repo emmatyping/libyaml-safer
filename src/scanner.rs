@@ -215,7 +215,13 @@ impl<R: BufRead> Scanner<R> {
             return;
         }
         let max = self.buffer.len().saturating_sub(lookahead);
-        let run = self.buffer.run_words(max, ordinary, after_blanks);
+        // After blanks the scalar loops start the next word with `cache(4)`,
+        // which may read (and fail to decode) more input before the word is
+        // scanned. Only continue into words that start where that is a no-op.
+        let max_word_start = self.buffer.len().saturating_sub(4);
+        let run = self
+            .buffer
+            .run_words(max, max_word_start, ordinary, after_blanks);
         self.buffer.take_run(run, string);
         self.mark.index += run.chars as u64;
         self.mark.column += run.chars as u64;
