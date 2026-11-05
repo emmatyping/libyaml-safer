@@ -1,8 +1,7 @@
+use crate::buffer::CharBuffer;
 use std::io::BufRead;
 
-use alloc::collections::VecDeque;
-
-use crate::{Encoding, Error, Result, scanner::Scanner};
+use crate::{scanner::Scanner, Encoding, Error, Result};
 
 const BOM_UTF8: [u8; 3] = [0xef, 0xbb, 0xbf];
 const BOM_UTF16LE: [u8; 2] = [0xff, 0xfe];
@@ -35,7 +34,7 @@ fn yaml_parser_determine_encoding(reader: &mut dyn BufRead) -> Result<Option<Enc
 #[allow(unsafe_code)]
 fn read_utf8_buffered(
     reader: &mut dyn BufRead,
-    out: &mut VecDeque<char>,
+    out: &mut CharBuffer,
     offset: &mut usize,
 ) -> Result<bool> {
     let available = loop {
@@ -51,10 +50,7 @@ fn read_utf8_buffered(
         Ok(valid) => {
             let used = valid.len();
             // The entire contents of the input buffer was valid UTF-8.
-            for ch in valid.chars() {
-                push_char(out, ch, *offset)?;
-                *offset += ch.len_utf8();
-            }
+            push_str(out, valid, offset)?;
             reader.consume(used);
             Ok(true)
         }
@@ -67,10 +63,7 @@ fn read_utf8_buffered(
                 // SAFETY: This is safe because of `valid_up_to()`.
                 core::str::from_utf8_unchecked(&available[..valid_bytes])
             };
-            for ch in valid.chars() {
-                push_char(out, ch, *offset)?;
-                *offset += ch.len_utf8();
-            }
+            push_str(out, valid, offset)?;
 
             match err.error_len() {
                 Some(_invalid_len) => Err(Error::reader(
@@ -104,7 +97,7 @@ fn read_utf8_buffered(
 
 fn read_utf8_char_unbuffered(
     reader: &mut dyn BufRead,
-    out: &mut VecDeque<char>,
+    out: &mut CharBuffer,
     initial: u8,
     offset: &mut usize,
 ) -> Result<()> {
@@ -129,7 +122,7 @@ fn read_utf8_char_unbuffered(
 
 fn read_utf16_buffered<const BIG_ENDIAN: bool>(
     reader: &mut dyn BufRead,
-    out: &mut VecDeque<char>,
+    out: &mut CharBuffer,
     offset: &mut usize,
 ) -> Result<bool> {
     let available = loop {
@@ -187,7 +180,7 @@ fn read_utf16_buffered<const BIG_ENDIAN: bool>(
 
 fn read_utf16_char_unbuffered<const BIG_ENDIAN: bool>(
     reader: &mut dyn BufRead,
-    out: &mut VecDeque<char>,
+    out: &mut CharBuffer,
     offset: &mut usize,
 ) -> Result<()> {
     let mut buffer = [0; 2];
@@ -249,16 +242,47 @@ fn is_utf16_surrogate(value: u16) -> bool {
     matches!(value, 0xD800..=0xDFFF)
 }
 
-fn push_char(out: &mut VecDeque<char>, ch: char, offset: usize) -> Result<()> {
-    if !(ch == '\x09'
+fn is_allowed(ch: char) -> bool {
+    ch == '\x09'
         || ch == '\x0A'
         || ch == '\x0D'
         || ch >= '\x20' && ch <= '\x7E'
         || ch == '\u{0085}'
         || ch >= '\u{00A0}' && ch <= '\u{D7FF}'
         || ch >= '\u{E000}' && ch <= '\u{FFFD}'
-        || ch >= '\u{10000}' && ch <= '\u{10FFFF}')
-    {
+        || ch >= '\u{10000}' && ch <= '\u{10FFFF}'
+}
+
+/// `push_char` for each character of `valid`, advancing `offset`: every
+/// character before the first one that is not allowed is pushed.
+fn push_str(out: &mut CharBuffer, valid: &str, offset: &mut usize) -> Result<()> {
+    let bytes = valid.as_bytes();
+    // Printable ASCII, tabs and line breaks are allowed.
+    let ascii = bytes
+        .iter()
+        .position(|&b| !(b >= 0x20 && b < 0x7f || b == b'\t' || b == b'\n' || b == b'\r'))
+        .unwrap_or(bytes.len());
+    let mut chars = ascii;
+    for (index, ch) in valid[ascii..].char_indices() {
+        let index = ascii + index;
+        if !is_allowed(ch) {
+            out.push_str(&valid[..index], chars);
+            *offset += index;
+            return Err(Error::reader(
+                "control characters are not allowed",
+                *offset,
+                ch as _,
+            ));
+        }
+        chars += 1;
+    }
+    out.push_str(valid, chars);
+    *offset += valid.len();
+    Ok(())
+}
+
+fn push_char(out: &mut CharBuffer, ch: char, offset: usize) -> Result<()> {
+    if !is_allowed(ch) {
         return Err(Error::reader(
             "control characters are not allowed",
             offset,

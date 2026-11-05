@@ -26,6 +26,7 @@ extern crate alloc;
 #[macro_use]
 mod macros;
 
+mod buffer;
 mod document;
 mod emitter;
 mod error;
