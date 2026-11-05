@@ -241,15 +241,14 @@ impl<'w> Emitter<'w> {
         Ok(())
     }
 
-    /// Set a string output.
+    /// Set a byte buffer output.
     ///
-    /// The emitter will write the output characters to the `output` buffer.
+    /// The emitter will write the encoded output to the `output` buffer:
+    /// UTF-8 unless a UTF-16 encoding has been set.
     pub fn set_output_string(&mut self, output: &'w mut Vec<u8>) {
         assert!(self.write_handler.is_none());
         if self.encoding == Encoding::Any {
             self.set_encoding(Encoding::Utf8);
-        } else if self.encoding != Encoding::Utf8 {
-            panic!("cannot output UTF-16 to String")
         }
         output.clear();
         self.write_handler = Some(output);
