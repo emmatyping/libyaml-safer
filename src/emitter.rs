@@ -24,12 +24,17 @@ const ORDINARY_BYTE: [bool; 256] = {
     table
 };
 
+/// The most strings `Emitter::spare_strings` keeps.
+const MAX_SPARE_STRINGS: usize = 8;
+
 /// The emitter structure.
 ///
 /// All members are internal. Manage the structure using the `yaml_emitter_`
 /// family of functions.
 #[non_exhaustive]
 pub struct Emitter<'w> {
+    /// Values of emitted scalar events, for `take_spare_string`.
+    spare_strings: Vec<String>,
     /// Write handler.
     pub(crate) write_handler: Option<&'w mut (dyn std::io::Write + Send + Sync)>,
     /// The working buffer.
@@ -193,6 +198,7 @@ impl<'w> Emitter<'w> {
     /// Create an self.
     pub fn new() -> Emitter<'w> {
         Emitter {
+            spare_strings: Vec::new(),
             write_handler: None,
             buffer: String::with_capacity(OUTPUT_BUFFER_SIZE),
             raw_buffer: Vec::with_capacity(OUTPUT_BUFFER_SIZE),
@@ -338,8 +344,22 @@ impl<'w> Emitter<'w> {
             if self.tag_directives.is_empty() {
                 self.tag_directives = tag_directives;
             }
+            if let EventData::Scalar { value, .. } = event.data {
+                if self.spare_strings.len() < MAX_SPARE_STRINGS {
+                    self.spare_strings.push(value);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// An empty string with the capacity of an emitted scalar's value, if
+    /// one is spare, to build the next scalar event's value in without
+    /// allocating.
+    pub fn take_spare_string(&mut self) -> String {
+        let mut string = self.spare_strings.pop().unwrap_or_default();
+        string.clear();
+        string
     }
 
     /// Equivalent of the libyaml `FLUSH` macro.
