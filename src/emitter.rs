@@ -303,8 +303,19 @@ impl<'w> Emitter<'w> {
         while let Some(event) = self.needs_mode_events() {
             let tag_directives = core::mem::take(&mut self.tag_directives);
 
-            let mut analysis = self.analyze_event(&event, &tag_directives)?;
-            self.state_machine(&event, &mut analysis)?;
+            let result = self
+                .analyze_event(&event, &tag_directives)
+                .and_then(|mut analysis| self.state_machine(&event, &mut analysis));
+            if let Err(error) = result {
+                // libyaml leaves a failed event at the head of the queue, so
+                // the next call processes it again (after a failed write, for
+                // example).
+                self.events.push_front(event);
+                if self.tag_directives.is_empty() {
+                    self.tag_directives = tag_directives;
+                }
+                return Err(error);
+            }
 
             // The DOCUMENT-START event populates the tag directives, and this
             // happens only once, so don't swap out the tags in that case.
@@ -2032,11 +2043,16 @@ impl<'w> Emitter<'w> {
 
         if self.encoding == Encoding::Utf8 {
             let to_emit = self.buffer.as_bytes();
-            self.write_handler
+            let result = self
+                .write_handler
                 .as_mut()
                 .expect("non-null writer")
-                .write_all(to_emit)?;
+                .write_all(to_emit);
+            // libyaml rewinds its buffer before writing, so even output that
+            // could not be written is dropped. (For UTF-16 it keeps both the
+            // buffer and the encoded output, as below.)
             self.buffer.clear();
+            result?;
             return Ok(());
         }
 
