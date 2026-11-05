@@ -403,6 +403,9 @@ impl<R: BufRead> Parser<R> {
                 tag_mark = token.start_mark;
                 end_mark = token.end_mark;
                 self.scanner.skip_token();
+                // libyaml peeks at the next token before resolving the tag
+                // handle, so a scanner error there wins over an undefined handle.
+                self.scanner.peek_mut()?;
             }
         } else if let TokenData::Tag { handle, suffix } = &mut token.data {
             tag_handle = Some(core::mem::take(handle));
@@ -416,6 +419,7 @@ impl<R: BufRead> Parser<R> {
                 anchor = Some(core::mem::take(value));
                 end_mark = token.end_mark;
                 self.scanner.skip_token();
+                self.scanner.peek_mut()?;
             }
         }
 

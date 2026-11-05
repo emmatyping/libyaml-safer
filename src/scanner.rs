@@ -1170,6 +1170,7 @@ impl<R: BufRead> Scanner<R> {
         let head = head.unwrap_or("");
         let mut length = head.len();
         let mut string = String::new();
+        let mut truncated = false;
 
         if length > 1 {
             string = String::from(&head[1..]);
@@ -1199,20 +1200,23 @@ impl<R: BufRead> Scanner<R> {
                     || CHECK!(self.buffer, '[')
                     || CHECK!(self.buffer, ']'))
         {
+            // C libyaml uses null-terminated strings, so a URI-decoded NUL
+            // byte (%00) effectively truncates the tag (keep scanning, but
+            // drop the rest). Match that behavior so that e.g. `!%00-`
+            // resolves to the non-specific tag `!` rather than producing a
+            // tag containing an embedded NUL.
             if CHECK!(self.buffer, '%') {
-                self.scan_uri_escapes(directive, start_mark, &mut string)?;
+                let octets = self.scan_uri_escapes(directive, start_mark)?;
+                if !truncated {
+                    truncated = push_uri_octets(&mut string, &octets);
+                }
+            } else if truncated {
+                self.skip_char()?;
             } else {
                 self.read_char(&mut string)?;
             }
             length += 1;
             self.cache(1)?;
-        }
-        // C libyaml uses null-terminated strings, so a URI-decoded NUL byte
-        // (%00) effectively truncates the tag suffix.  Match that behavior so
-        // that e.g. `!%00-` resolves to the non-specific tag `!` rather than
-        // producing a tag containing an embedded NUL.
-        if let Some(pos) = string.find('\0') {
-            string.truncate(pos);
         }
         if length == 0 {
             self.set_scanner_error(
@@ -1229,12 +1233,11 @@ impl<R: BufRead> Scanner<R> {
         }
     }
 
-    fn scan_uri_escapes(
-        &mut self,
-        directive: bool,
-        start_mark: Mark,
-        string: &mut String,
-    ) -> Result<()> {
+    /// Scans one URI-escaped UTF-8 sequence (`%XX` octets) and returns its
+    /// octets. Like libyaml, this only checks the leading octet's width and
+    /// that the trailing octets are continuation bytes.
+    fn scan_uri_escapes(&mut self, directive: bool, start_mark: Mark) -> Result<Vec<u8>> {
+        let mut octets = Vec::with_capacity(4);
         let mut width: i32 = 0;
         loop {
             self.cache(3)?;
@@ -1265,7 +1268,6 @@ impl<R: BufRead> Scanner<R> {
                 } else {
                     0
                 };
-                // TODO: Something is fishy here, why isn't `width` being used?
                 if width == 0 {
                     return self.set_scanner_error(
                         if directive {
@@ -1288,7 +1290,7 @@ impl<R: BufRead> Scanner<R> {
                     "found an incorrect trailing UTF-8 octet",
                 );
             }
-            string.push(char::from_u32(octet as _).expect("invalid Unicode"));
+            octets.push(octet);
             self.skip_char()?;
             self.skip_char()?;
             self.skip_char()?;
@@ -1297,7 +1299,7 @@ impl<R: BufRead> Scanner<R> {
                 break;
             }
         }
-        Ok(())
+        Ok(octets)
     }
 
     fn scan_block_scalar(&mut self, literal: bool) -> Result<Token> {
@@ -1893,3 +1895,34 @@ impl<R: BufRead> Iterator for Scanner<R> {
 }
 
 impl<R: BufRead> core::iter::FusedIterator for Scanner<R> {}
+
+/// Marks a URI-escaped octet sequence in a tag that is not valid UTF-8.
+///
+/// libyaml passes the octets of `%XX` escapes through as raw bytes after only
+/// checking the UTF-8 lead and continuation bits, so overlong encodings,
+/// surrogates and values above U+10FFFF reach the application, where e.g.
+/// Python's `yaml` module fails to decode the tag. A `String` cannot hold those octets, so such
+/// a sequence is kept as this marker followed by its escapes in upper case
+/// (`!a%c1%88` becomes `"!a\0%C1%88"`). The marker cannot otherwise appear in a
+/// tag, since a decoded NUL ends the tag (as in libyaml's C strings).
+pub const INVALID_UTF8_ESCAPE: char = '\0';
+
+/// Appends one URI-escaped sequence's `octets` to `string`, returning true if
+/// they were a NUL, which ends the tag.
+fn push_uri_octets(string: &mut String, octets: &[u8]) -> bool {
+    if octets == [0] {
+        return true;
+    }
+    if let Ok(text) = core::str::from_utf8(octets) {
+        string.push_str(text);
+    } else {
+        string.push(INVALID_UTF8_ESCAPE);
+        for octet in octets {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            string.push('%');
+            string.push(char::from(HEX[usize::from(octet >> 4)]));
+            string.push(char::from(HEX[usize::from(octet & 0xf)]));
+        }
+    }
+    false
+}
