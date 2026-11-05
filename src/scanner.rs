@@ -187,6 +187,28 @@ impl<R: BufRead> Scanner<R> {
         self.mark.column += run.chars as u64;
     }
 
+    /// `read_run` for runs that may contain blanks between words (see
+    /// `CharBuffer::run_words`). Blanks inside a line are kept as they are in
+    /// flow and plain scalars; trailing blanks are left to the caller.
+    fn read_words(
+        &mut self,
+        string: &mut String,
+        lookahead: usize,
+        ordinary: impl Fn(char) -> bool,
+        after_blanks: impl Fn(char) -> bool,
+    ) {
+        self.read_run(string, lookahead, &ordinary);
+        // Most runs end at a line break or an indicator, not at a blank.
+        if !matches!(self.buffer.front(), Some(' ' | '\t')) {
+            return;
+        }
+        let max = self.buffer.len().saturating_sub(lookahead);
+        let run = self.buffer.run_words(max, ordinary, after_blanks);
+        self.buffer.take_run(run, string);
+        self.mark.index += run.chars as u64;
+        self.mark.column += run.chars as u64;
+    }
+
     /// `read_run` for characters that are skipped rather than read.
     fn skip_run(&mut self, lookahead: usize, ordinary: impl Fn(char) -> bool) {
         let max = self.buffer.len().saturating_sub(lookahead);
@@ -1722,9 +1744,12 @@ impl<R: BufRead> Scanner<R> {
                         }
                     } else {
                         self.read_char(&mut string)?;
-                        self.read_run(&mut string, 2, |ch| {
-                            !matches!(ch, '\'' | '"' | '\\') && !is_blankz(ch)
-                        });
+                        self.read_words(
+                            &mut string,
+                            2,
+                            |ch| !matches!(ch, '\'' | '"' | '\\') && !is_blankz(ch),
+                            |_| true,
+                        );
                     }
                 }
                 self.cache(2)?;
@@ -1880,11 +1905,17 @@ impl<R: BufRead> Scanner<R> {
                 }
                 self.read_char(&mut string)?;
                 let flow = self.flow_level != 0;
-                self.read_run(&mut string, 2, |ch| {
-                    ch != ':'
-                        && !is_blankz(ch)
-                        && !(flow && matches!(ch, ',' | '[' | ']' | '{' | '}'))
-                });
+                // A `#` after blanks starts a comment.
+                self.read_words(
+                    &mut string,
+                    2,
+                    |ch| {
+                        ch != ':'
+                            && !is_blankz(ch)
+                            && !(flow && matches!(ch, ',' | '[' | ']' | '{' | '}'))
+                    },
+                    |ch| ch != '#',
+                );
                 end_mark = self.mark;
                 self.cache(2)?;
             }

@@ -124,6 +124,51 @@ impl CharBuffer {
         run
     }
 
+    /// Like `run`, but the run may also contain spaces and tabs between
+    /// `ordinary` characters, where the character after the blanks also
+    /// passes `after_blanks`. It never ends in blanks.
+    #[inline]
+    pub(crate) fn run_words(
+        &self,
+        max: usize,
+        ordinary: impl Fn(char) -> bool,
+        after_blanks: impl Fn(char) -> bool,
+    ) -> Run {
+        let mut run = Run { chars: 0, bytes: 0 };
+        // The run so far plus blanks that are not part of it yet.
+        let mut end = run;
+        let mut blanks = false;
+        while end.chars < max {
+            let Some(ch) = self.char_at_byte(end.bytes) else {
+                break;
+            };
+            if ch == ' ' || ch == '\t' {
+                blanks = true;
+            } else if ordinary(ch) && (!blanks || after_blanks(ch)) {
+                blanks = false;
+            } else {
+                break;
+            }
+            end.chars += 1;
+            end.bytes += ch.len_utf8();
+            if !blanks {
+                run = end;
+            }
+        }
+        run
+    }
+
+    /// The character at byte offset `at` of the unconsumed text.
+    #[inline(always)]
+    fn char_at_byte(&self, at: usize) -> Option<char> {
+        let &lead = self.text.as_bytes().get(self.pos + at)?;
+        if lead < 0x80 {
+            Some(char::from(lead))
+        } else {
+            self.decode(self.pos + at)
+        }
+    }
+
     /// Drop a run from the front.
     #[inline]
     pub(crate) fn skip_run(&mut self, run: Run) {
