@@ -129,6 +129,12 @@ impl<R: BufRead> Iterator for Parser<R> {
 impl<R: BufRead> core::iter::FusedIterator for Parser<R> {}
 
 impl<R> Parser<R> {
+    /// Give back the string of a scalar event's value once it is no longer
+    /// needed, so the parser can reuse its allocation for a later scalar.
+    pub fn recycle(&mut self, string: String) {
+        self.scanner.recycle(string);
+    }
+
     /// Create a parser.
     pub fn new() -> Parser<R> {
         Parser {

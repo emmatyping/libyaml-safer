@@ -60,7 +60,12 @@ struct Scratch {
     leading_break: String,
     trailing_breaks: String,
     whitespaces: String,
+    /// Scalar values given back by the caller, to scan later scalars into.
+    spare: Vec<String>,
 }
+
+/// The most strings `Scratch::spare` keeps.
+const MAX_SPARE_STRINGS: usize = 8;
 
 impl<'r, 'b> Scanner<&'r mut &'b [u8]> {
     /// Set a string input.
@@ -71,6 +76,13 @@ impl<'r, 'b> Scanner<&'r mut &'b [u8]> {
 }
 
 impl<R> Scanner<R> {
+    /// Keep a scalar value's string to scan a later scalar into.
+    pub(crate) fn recycle(&mut self, string: String) {
+        if self.scratch.spare.len() < MAX_SPARE_STRINGS && string.capacity() > 0 {
+            self.scratch.spare.push(string);
+        }
+    }
+
     pub fn new() -> Scanner<R> {
         Self {
             read_handler: None,
@@ -1498,8 +1510,9 @@ impl<R: BufRead> Scanner<R> {
             string.push_str(&trailing_breaks);
         }
 
-        // Exactly sized: the scratch strings keep their capacity.
-        let value = String::from(string.as_str());
+        // Hand out the scratch string itself, and scan the next scalar into a
+        // string returned by `Parser::recycle` if there is one.
+        let value = core::mem::replace(&mut string, self.scratch.spare.pop().unwrap_or_default());
         self.scratch.string = string;
         self.scratch.leading_break = leading_break;
         self.scratch.trailing_breaks = trailing_breaks;
@@ -1803,8 +1816,9 @@ impl<R: BufRead> Scanner<R> {
 
         self.skip_char()?;
         let end_mark: Mark = self.mark;
-        // Exactly sized: the scratch strings keep their capacity.
-        let value = String::from(string.as_str());
+        // Hand out the scratch string itself, and scan the next scalar into a
+        // string returned by `Parser::recycle` if there is one.
+        let value = core::mem::replace(&mut string, self.scratch.spare.pop().unwrap_or_default());
         self.scratch.string = string;
         self.scratch.leading_break = leading_break;
         self.scratch.trailing_breaks = trailing_breaks;
@@ -1963,8 +1977,9 @@ impl<R: BufRead> Scanner<R> {
             self.simple_key_allowed = true;
         }
 
-        // Exactly sized: the scratch strings keep their capacity.
-        let value = String::from(string.as_str());
+        // Hand out the scratch string itself, and scan the next scalar into a
+        // string returned by `Parser::recycle` if there is one.
+        let value = core::mem::replace(&mut string, self.scratch.spare.pop().unwrap_or_default());
         self.scratch.string = string;
         self.scratch.leading_break = leading_break;
         self.scratch.trailing_breaks = trailing_breaks;
