@@ -351,20 +351,29 @@ impl<'w> Emitter<'w> {
     /// `emitter.column` the appropriate number of times. It is assumed that the
     /// string does not contain line breaks!
     fn write_str(&mut self, string: &str) -> Result<()> {
-        if self.buffer.len() + string.len() > OUTPUT_BUFFER_SIZE {
-            self.flush()?;
-        }
-
-        // Note: Reserves less than what is necessary if there are UTF-8
-        // characters present.
-        self.buffer.reserve(string.len());
-
         self.column += string.chars().count() as i32;
+        self.write_text(string)
+    }
 
-        // Note: This may cause the buffer to become slightly larger than
-        // `OUTPUT_BUFFER_SIZE`, but not by much.
-        self.buffer.push_str(string);
-
+    /// Append `text` to the buffer, flushing where libyaml would: its `FLUSH`
+    /// check runs before every character and flushes once fewer than 5 bytes
+    /// are free, so the output reaches the writer in the same pieces. Does not
+    /// update the column.
+    fn write_text(&mut self, mut text: &str) -> Result<()> {
+        while !text.is_empty() {
+            let room = (OUTPUT_BUFFER_SIZE - 5).saturating_sub(self.buffer.len());
+            if room == 0 {
+                self.flush()?;
+                continue;
+            }
+            // Every character starting before `room` is written unflushed.
+            let mut end = room.min(text.len());
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            self.buffer.push_str(&text[..end]);
+            text = &text[end..];
+        }
         Ok(())
     }
 
@@ -1566,12 +1575,8 @@ impl<'w> Emitter<'w> {
                     self.write_indent()?;
                 }
                 let chunk = &value[start..i];
-                if self.buffer.len() + chunk.len() > OUTPUT_BUFFER_SIZE {
-                    self.flush()?;
-                }
-                self.buffer.reserve(chunk.len());
                 self.column += chunk.len() as i32;
-                self.buffer.push_str(chunk);
+                self.write_text(chunk)?;
                 self.indention = false;
                 spaces = false;
                 breaks = false;
@@ -1658,12 +1663,8 @@ impl<'w> Emitter<'w> {
                     self.write_indent()?;
                 }
                 let chunk = &value[start..i];
-                if self.buffer.len() + chunk.len() > OUTPUT_BUFFER_SIZE {
-                    self.flush()?;
-                }
-                self.buffer.reserve(chunk.len());
                 self.column += chunk.len() as i32;
-                self.buffer.push_str(chunk);
+                self.write_text(chunk)?;
                 self.indention = false;
                 spaces = false;
                 breaks = false;
@@ -1770,13 +1771,9 @@ impl<'w> Emitter<'w> {
                 // start..i bytes are all ASCII (<0x80), so the indices are at
                 // valid char boundaries of `value`; slicing is safe.
                 let chunk = &value[start..i];
-                if self.buffer.len() + chunk.len() > OUTPUT_BUFFER_SIZE {
-                    self.flush()?;
-                }
-                self.buffer.reserve(chunk.len());
                 // Pure ASCII run: column advances by exactly chunk.len().
                 self.column += chunk.len() as i32;
-                self.buffer.push_str(chunk);
+                self.write_text(chunk)?;
                 spaces = false;
                 first = false;
                 continue;
