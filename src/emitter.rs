@@ -1909,6 +1909,15 @@ impl<'w> Emitter<'w> {
                     }
                 }
                 spaces = false;
+            } else if ch == ' ' && spaces {
+                // After a space, spaces cannot start a line break (libyaml
+                // checks `!spaces`), so write the whole run.
+                let run = bytes[i..].iter().take_while(|&&b| b == b' ').count();
+                self.column += run as i32;
+                self.write_text(&value[i..i + run])?;
+                first = false;
+                i += run;
+                continue;
             } else if ch == ' ' {
                 // Space: needs lookahead for wrap/line-continuation logic.
                 let next_pos = i + ch_len;
