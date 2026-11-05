@@ -1988,9 +1988,15 @@ impl<'w> Emitter<'w> {
         while let Some(ch) = chars.next() {
             if is_break(ch) {
                 if !breaks && !leading_spaces && ch == '\n' {
-                    let mut skip_breaks = chars.clone();
-                    while is_break(skip_breaks.next()) {}
-                    if !is_blankz(skip_breaks.next()) {
+                    // libyaml: the first character after this run of breaks.
+                    let mut rest = chars.clone();
+                    let after_breaks = loop {
+                        let next = rest.next();
+                        if !is_break(next) {
+                            break next;
+                        }
+                    };
+                    if !is_blankz(after_breaks) {
                         self.put_break()?;
                     }
                 }
