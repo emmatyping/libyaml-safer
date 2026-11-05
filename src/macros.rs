@@ -104,7 +104,7 @@ macro_rules! IS_BOM {
 }
 
 pub(crate) fn is_bom(ch: char) -> bool {
-    ch == '\u{7eff}'
+    ch == '\u{feff}'
 }
 
 macro_rules! IS_SPACE_AT {
@@ -217,13 +217,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bom() {
+        assert!(is_bom('\u{feff}'));
+        assert!(!is_bom('\u{7eff}'));
+    }
+
+    #[test]
     fn printable() {
         for ch in ['a', '\n', '\u{a0}', 'é', '\u{d7ff}', '\u{e000}', '\u{fffd}'] {
             assert!(is_printable(ch), "{ch:?}");
         }
         // Like libyaml: no 4-byte UTF-8 characters, BOM, U+FFFE/U+FFFF,
         // controls (tab, NEL) or surrogate range neighbours.
-        for ch in ['\u{1f389}', '\u{10000}', '\u{feff}', '\u{fffe}', '\t', '\u{85}'] {
+        for ch in [
+            '\u{1f389}',
+            '\u{10000}',
+            '\u{feff}',
+            '\u{fffe}',
+            '\t',
+            '\u{85}',
+        ] {
             assert!(!is_printable(ch), "{ch:?}");
         }
     }
