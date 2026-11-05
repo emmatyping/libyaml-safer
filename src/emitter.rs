@@ -8,6 +8,22 @@ use crate::{
     TagDirective, VersionDirective, OUTPUT_BUFFER_SIZE,
 };
 
+/// Bytes that, after a scalar's first character, change nothing in
+/// `analyze_scalar` but the "previous character" flags: printable ASCII other
+/// than space and the indicators checked mid-scalar (`,?[]{}:#`).
+const ORDINARY_BYTE: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut b = 0x21;
+    while b <= 0x7e {
+        table[b] = !matches!(
+            b as u8,
+            b',' | b'?' | b'[' | b']' | b'{' | b'}' | b':' | b'#'
+        );
+        b += 1;
+    }
+    table
+};
+
 /// The emitter structure.
 ///
 /// All members are internal. Manage the structure using the `yaml_emitter_`
@@ -1206,6 +1222,19 @@ impl<'w> Emitter<'w> {
 
         while i < len {
             let b = bytes[i];
+
+            // After the first character, a run of ordinary bytes only resets
+            // the "previous" flags, so skip it in one go.
+            if !first && ORDINARY_BYTE[b as usize] {
+                i += 1;
+                while i < len && ORDINARY_BYTE[bytes[i] as usize] {
+                    i += 1;
+                }
+                previous_space = false;
+                previous_break = false;
+                preceded_by_whitespace = false;
+                continue;
+            }
 
             if b < 0x80 {
                 let next_pos = i + 1;

@@ -71,6 +71,9 @@ pub(crate) fn is_ascii(ch: char) -> bool {
 /// libyaml's `IS_PRINTABLE`, which only accepts characters of up to three
 /// UTF-8 bytes: characters beyond the Basic Multilingual Plane are escaped.
 pub(crate) fn is_printable(ch: char) -> bool {
+    if ch.is_ascii() {
+        return ch == '\n' || matches!(ch, '\x20'..='\x7e');
+    }
     match ch {
         '\u{feff}' | '\u{fffe}' | '\u{ffff}' => false,
         // ASCII
