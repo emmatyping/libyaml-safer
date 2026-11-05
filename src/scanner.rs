@@ -815,25 +815,19 @@ impl<R: BufRead> Scanner<R> {
     fn fetch_block_scalar(&mut self, literal: bool) -> Result<()> {
         self.remove_simple_key()?;
         self.simple_key_allowed = true;
-        let token = self.scan_block_scalar(literal)?;
-        self.tokens.push_back(token);
-        Ok(())
+        self.scan_block_scalar(literal)
     }
 
     fn fetch_flow_scalar(&mut self, single: bool) -> Result<()> {
         self.save_simple_key()?;
         self.simple_key_allowed = false;
-        let token = self.scan_flow_scalar(single)?;
-        self.tokens.push_back(token);
-        Ok(())
+        self.scan_flow_scalar(single)
     }
 
     fn fetch_plain_scalar(&mut self) -> Result<()> {
         self.save_simple_key()?;
         self.simple_key_allowed = false;
-        let token = self.scan_plain_scalar()?;
-        self.tokens.push_back(token);
-        Ok(())
+        self.scan_plain_scalar()
     }
 
     fn scan_to_next_token(&mut self) -> Result<()> {
@@ -1336,7 +1330,7 @@ impl<R: BufRead> Scanner<R> {
         Ok(octets)
     }
 
-    fn scan_block_scalar(&mut self, literal: bool) -> Result<Token> {
+    fn scan_block_scalar(&mut self, literal: bool) -> Result<()> {
         let mut end_mark: Mark;
         let mut string = core::mem::take(&mut self.scratch.string);
         string.clear();
@@ -1487,7 +1481,7 @@ impl<R: BufRead> Scanner<R> {
         self.scratch.string = string;
         self.scratch.leading_break = leading_break;
         self.scratch.trailing_breaks = trailing_breaks;
-        Ok(Token {
+        self.tokens.push_back(Token {
             data: TokenData::Scalar {
                 value,
                 style: if literal {
@@ -1498,7 +1492,8 @@ impl<R: BufRead> Scanner<R> {
             },
             start_mark,
             end_mark,
-        })
+        });
+        Ok(())
     }
 
     fn scan_block_scalar_breaks(
@@ -1545,7 +1540,7 @@ impl<R: BufRead> Scanner<R> {
         Ok(())
     }
 
-    fn scan_flow_scalar(&mut self, single: bool) -> Result<Token> {
+    fn scan_flow_scalar(&mut self, single: bool) -> Result<()> {
         let mut string = core::mem::take(&mut self.scratch.string);
         string.clear();
         let mut leading_break = core::mem::take(&mut self.scratch.leading_break);
@@ -1789,7 +1784,7 @@ impl<R: BufRead> Scanner<R> {
         self.scratch.leading_break = leading_break;
         self.scratch.trailing_breaks = trailing_breaks;
         self.scratch.whitespaces = whitespaces;
-        Ok(Token {
+        self.tokens.push_back(Token {
             data: TokenData::Scalar {
                 value,
                 style: if single {
@@ -1800,10 +1795,11 @@ impl<R: BufRead> Scanner<R> {
             },
             start_mark,
             end_mark,
-        })
+        });
+        Ok(())
     }
 
-    fn scan_plain_scalar(&mut self) -> Result<Token> {
+    fn scan_plain_scalar(&mut self) -> Result<()> {
         let mut end_mark: Mark;
         let mut string = core::mem::take(&mut self.scratch.string);
         string.clear();
@@ -1942,14 +1938,15 @@ impl<R: BufRead> Scanner<R> {
         self.scratch.leading_break = leading_break;
         self.scratch.trailing_breaks = trailing_breaks;
         self.scratch.whitespaces = whitespaces;
-        Ok(Token {
+        self.tokens.push_back(Token {
             data: TokenData::Scalar {
                 value,
                 style: ScalarStyle::Plain,
             },
             start_mark,
             end_mark,
-        })
+        });
+        Ok(())
     }
 }
 
