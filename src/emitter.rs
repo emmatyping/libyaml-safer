@@ -321,33 +321,50 @@ impl<'w> Emitter<'w> {
     /// the responsibility for the event object and destroys its content after
     /// it is emitted. The event object is destroyed even if the function fails.
     pub fn emit(&mut self, event: Event) -> Result<()> {
+        // An event that needs no lookahead, with none waiting before it, is
+        // processed at once (as the loop below would) without queueing it.
+        if self.events.is_empty()
+            && !matches!(
+                event.data,
+                EventData::DocumentStart { .. }
+                    | EventData::SequenceStart { .. }
+                    | EventData::MappingStart { .. }
+            )
+        {
+            return self.process_event(event);
+        }
         self.events.push_back(event);
         while let Some(event) = self.needs_mode_events() {
-            let tag_directives = core::mem::take(&mut self.tag_directives);
+            self.process_event(event)?;
+        }
+        Ok(())
+    }
 
-            let result = self
-                .analyze_event(&event, &tag_directives)
-                .and_then(|mut analysis| self.state_machine(&event, &mut analysis));
-            if let Err(error) = result {
-                // libyaml leaves a failed event at the head of the queue, so
-                // the next call processes it again (after a failed write, for
-                // example).
-                self.events.push_front(event);
-                if self.tag_directives.is_empty() {
-                    self.tag_directives = tag_directives;
-                }
-                return Err(error);
-            }
+    fn process_event(&mut self, event: Event) -> Result<()> {
+        let tag_directives = core::mem::take(&mut self.tag_directives);
 
-            // The DOCUMENT-START event populates the tag directives, and this
-            // happens only once, so don't swap out the tags in that case.
+        let result = self
+            .analyze_event(&event, &tag_directives)
+            .and_then(|mut analysis| self.state_machine(&event, &mut analysis));
+        if let Err(error) = result {
+            // libyaml leaves a failed event at the head of the queue, so
+            // the next call processes it again (after a failed write, for
+            // example).
+            self.events.push_front(event);
             if self.tag_directives.is_empty() {
                 self.tag_directives = tag_directives;
             }
-            if let EventData::Scalar { value, .. } = event.data {
-                if self.spare_strings.len() < MAX_SPARE_STRINGS {
-                    self.spare_strings.push(value);
-                }
+            return Err(error);
+        }
+
+        // The DOCUMENT-START event populates the tag directives, and this
+        // happens only once, so don't swap out the tags in that case.
+        if self.tag_directives.is_empty() {
+            self.tag_directives = tag_directives;
+        }
+        if let EventData::Scalar { value, .. } = event.data {
+            if self.spare_strings.len() < MAX_SPARE_STRINGS {
+                self.spare_strings.push(value);
             }
         }
         Ok(())
