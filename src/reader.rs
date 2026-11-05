@@ -2,7 +2,7 @@ use std::io::BufRead;
 
 use alloc::collections::VecDeque;
 
-use crate::{Encoding, Error, Result, scanner::Scanner};
+use crate::{scanner::Scanner, Encoding, Error, Result};
 
 const BOM_UTF8: [u8; 3] = [0xef, 0xbb, 0xbf];
 const BOM_UTF16LE: [u8; 2] = [0xff, 0xfe];
@@ -51,10 +51,7 @@ fn read_utf8_buffered(
         Ok(valid) => {
             let used = valid.len();
             // The entire contents of the input buffer was valid UTF-8.
-            for ch in valid.chars() {
-                push_char(out, ch, *offset)?;
-                *offset += ch.len_utf8();
-            }
+            push_str(out, valid, offset)?;
             reader.consume(used);
             Ok(true)
         }
@@ -67,10 +64,7 @@ fn read_utf8_buffered(
                 // SAFETY: This is safe because of `valid_up_to()`.
                 core::str::from_utf8_unchecked(&available[..valid_bytes])
             };
-            for ch in valid.chars() {
-                push_char(out, ch, *offset)?;
-                *offset += ch.len_utf8();
-            }
+            push_str(out, valid, offset)?;
 
             match err.error_len() {
                 Some(_invalid_len) => Err(Error::reader(
@@ -249,16 +243,42 @@ fn is_utf16_surrogate(value: u16) -> bool {
     matches!(value, 0xD800..=0xDFFF)
 }
 
-fn push_char(out: &mut VecDeque<char>, ch: char, offset: usize) -> Result<()> {
-    if !(ch == '\x09'
+fn is_allowed(ch: char) -> bool {
+    ch == '\x09'
         || ch == '\x0A'
         || ch == '\x0D'
         || ch >= '\x20' && ch <= '\x7E'
         || ch == '\u{0085}'
         || ch >= '\u{00A0}' && ch <= '\u{D7FF}'
         || ch >= '\u{E000}' && ch <= '\u{FFFD}'
-        || ch >= '\u{10000}' && ch <= '\u{10FFFF}')
-    {
+        || ch >= '\u{10000}' && ch <= '\u{10FFFF}'
+}
+
+/// `push_char` for each character of `valid`, advancing `offset`: every
+/// character before the first one that is not allowed is pushed. Runs of
+/// allowed ASCII are pushed in bulk.
+fn push_str(out: &mut VecDeque<char>, valid: &str, offset: &mut usize) -> Result<()> {
+    let bytes = valid.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let run = bytes[i..]
+            .iter()
+            .position(|&b| !(b.is_ascii() && is_allowed(char::from(b))))
+            .unwrap_or(bytes.len() - i);
+        out.extend(bytes[i..i + run].iter().map(|&b| char::from(b)));
+        i += run;
+        *offset += run;
+        if let Some(ch) = valid[i..].chars().next() {
+            push_char(out, ch, *offset)?;
+            i += ch.len_utf8();
+            *offset += ch.len_utf8();
+        }
+    }
+    Ok(())
+}
+
+fn push_char(out: &mut VecDeque<char>, ch: char, offset: usize) -> Result<()> {
+    if !is_allowed(ch) {
         return Err(Error::reader(
             "control characters are not allowed",
             offset,

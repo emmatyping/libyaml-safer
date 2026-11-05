@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 use std::io::BufRead;
 
-use crate::macros::{is_blankz, is_break};
+use crate::macros::{is_blank, is_blankz, is_break};
 use crate::reader::yaml_parser_update_buffer;
 use crate::{
-    Encoding, Error, INPUT_BUFFER_SIZE, Mark, Result, ScalarStyle, SimpleKey, Token, TokenData,
+    Encoding, Error, Mark, Result, ScalarStyle, SimpleKey, Token, TokenData, INPUT_BUFFER_SIZE,
 };
 
 const MAX_NUMBER_LENGTH: u64 = 9_u64;
@@ -161,13 +161,54 @@ impl<R: BufRead> Scanner<R> {
         Ok(())
     }
 
+    /// Read the run of `ordinary` characters at the front of the buffer at
+    /// once, as a loop of `read_char` and `cache(lookahead)` would, but only
+    /// as far as the buffer holds `lookahead` characters past the run. The
+    /// caller's loop reads the rest one at a time, so the buffer is refilled
+    /// (and any decoding error raised) at the same point as without this.
+    fn read_run(&mut self, string: &mut String, lookahead: usize, ordinary: impl Fn(char) -> bool) {
+        let max = self.buffer.len().saturating_sub(lookahead);
+        let (front, back) = self.buffer.as_slices();
+        let mut n = front
+            .iter()
+            .take(max)
+            .take_while(|&&ch| ordinary(ch))
+            .count();
+        if n == front.len() && n < max {
+            n += back
+                .iter()
+                .take(max - n)
+                .take_while(|&&ch| ordinary(ch))
+                .count();
+        }
+        if n == 0 {
+            return;
+        }
+        string.extend(self.buffer.drain(..n));
+        self.mark.index += n as u64;
+        self.mark.column += n as u64;
+    }
+
+    /// `read_run` for characters that are skipped rather than read.
+    fn skip_run(&mut self, lookahead: usize, ordinary: impl Fn(char) -> bool) {
+        let max = self.buffer.len().saturating_sub(lookahead);
+        let n = self
+            .buffer
+            .iter()
+            .take(max)
+            .take_while(|&&ch| ordinary(ch))
+            .count();
+        self.buffer.drain(..n);
+        self.mark.index += n as u64;
+        self.mark.column += n as u64;
+    }
+
     /// Equivalent to the libyaml macro `READ_LINE`.
     fn read_line_break(&mut self, string: &mut String) -> Result<()> {
-        let front = self
-            .buffer
-            .front()
-            .copied()
-            .ok_or_else(|| Error::scanner("", self.mark, "unexpected end of input", self.mark))?;
+        let front =
+            self.buffer.front().copied().ok_or_else(|| {
+                Error::scanner("", self.mark, "unexpected end of input", self.mark)
+            })?;
 
         if let ('\r', Some('\n')) = (front, self.buffer.get(1).copied()) {
             string.push('\n');
@@ -1420,6 +1461,7 @@ impl<R: BufRead> Scanner<R> {
             leading_blank = IS_BLANK!(self.buffer) as i32;
             while !IS_BREAKZ!(self.buffer) {
                 self.read_char(&mut string)?;
+                self.read_run(&mut string, 1, |ch| !is_break(ch));
                 self.cache(1)?;
             }
             // If we hit EOF rather than a line break, stop scanning.
@@ -1680,6 +1722,9 @@ impl<R: BufRead> Scanner<R> {
                         }
                     } else {
                         self.read_char(&mut string)?;
+                        self.read_run(&mut string, 2, |ch| {
+                            !matches!(ch, '\'' | '"' | '\\') && !is_blankz(ch)
+                        });
                     }
                 }
                 self.cache(2)?;
@@ -1693,8 +1738,10 @@ impl<R: BufRead> Scanner<R> {
                 if IS_BLANK!(self.buffer) {
                     if leading_blanks {
                         self.skip_char()?;
+                        self.skip_run(1, is_blank);
                     } else {
                         self.read_char(&mut whitespaces)?;
+                        self.read_run(&mut whitespaces, 1, is_blank);
                     }
                 } else {
                     self.cache(2)?;
@@ -1821,6 +1868,12 @@ impl<R: BufRead> Scanner<R> {
                     }
                 }
                 self.read_char(&mut string)?;
+                let flow = self.flow_level != 0;
+                self.read_run(&mut string, 2, |ch| {
+                    ch != ':'
+                        && !is_blankz(ch)
+                        && !(flow && matches!(ch, ',' | '[' | ']' | '{' | '}'))
+                });
                 end_mark = self.mark;
                 self.cache(2)?;
             }
@@ -1840,8 +1893,11 @@ impl<R: BufRead> Scanner<R> {
                         );
                     } else if !leading_blanks {
                         self.read_char(&mut whitespaces)?;
+                        self.read_run(&mut whitespaces, 1, is_blank);
                     } else {
+                        // Tabs are checked against the indentation one at a time.
                         self.skip_char()?;
+                        self.skip_run(1, |ch| ch == ' ');
                     }
                 } else {
                     self.cache(2)?;
