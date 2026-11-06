@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io::BufRead;
 
 use crate::buffer::CharBuffer;
-use crate::macros::{is_blank, is_blankz, is_break};
+use crate::macros::{is_blank, is_blankz, is_break, is_breakz};
 use crate::reader::yaml_parser_update_buffer;
 use crate::simd::PlainAscii;
 use crate::{
@@ -139,6 +139,8 @@ impl<R> Scanner<R> {
     }
 }
 
+/// Printable ASCII and tabs: text within a line.
+static LINE_TEXT: PlainAscii = PlainAscii::new(b"");
 /// Printable ASCII that continues a word in a quoted scalar.
 static QUOTED_WORDS: PlainAscii = PlainAscii::new(b"'\"\\");
 /// Printable ASCII that continues a word in a plain scalar, in block context.
@@ -205,6 +207,50 @@ impl<R: BufRead> Scanner<R> {
         self.buffer.take_run(run, string);
         self.mark.index += run.chars as u64;
         self.mark.column += run.chars as u64;
+    }
+
+    /// `read_run` for a run whose ASCII is in `class` (which must pass
+    /// `ordinary`): that part is read 16 bytes at a time.
+    fn read_ascii_run(
+        &mut self,
+        string: &mut String,
+        lookahead: usize,
+        class: &PlainAscii,
+        ordinary: impl Fn(char) -> bool,
+    ) {
+        let max = self.buffer.len().saturating_sub(lookahead);
+        let run = self.buffer.ascii_run(max, class);
+        self.buffer.take_run(run, string);
+        self.mark.index += run.chars as u64;
+        self.mark.column += run.chars as u64;
+        self.read_run(string, lookahead, ordinary);
+    }
+
+    /// Skip a comment, up to the line break or the end of the input.
+    #[inline(never)]
+    fn skip_comment(&mut self) -> Result<()> {
+        while !IS_BREAKZ!(self.buffer) {
+            self.skip_char()?;
+            self.skip_ascii_run(1, &LINE_TEXT, |ch| !is_breakz(ch));
+            self.cache(1)?;
+        }
+        Ok(())
+    }
+
+    /// `skip_run` for a run whose ASCII is in `class` (which must pass
+    /// `ordinary`): that part is skipped 16 bytes at a time.
+    fn skip_ascii_run(
+        &mut self,
+        lookahead: usize,
+        class: &PlainAscii,
+        ordinary: impl Fn(char) -> bool,
+    ) {
+        let max = self.buffer.len().saturating_sub(lookahead);
+        let run = self.buffer.ascii_run(max, class);
+        self.buffer.skip_run(run);
+        self.mark.index += run.chars as u64;
+        self.mark.column += run.chars as u64;
+        self.skip_run(lookahead, ordinary);
     }
 
     /// `read_run` for runs that may contain blanks between words (see
@@ -906,10 +952,7 @@ impl<R: BufRead> Scanner<R> {
                 self.cache(1)?;
             }
             if CHECK!(self.buffer, '#') {
-                while !IS_BREAKZ!(self.buffer) {
-                    self.skip_char()?;
-                    self.cache(1)?;
-                }
+                self.skip_comment()?;
             }
             if !IS_BREAK!(self.buffer) {
                 break;
@@ -1513,7 +1556,7 @@ impl<R: BufRead> Scanner<R> {
             leading_blank = IS_BLANK!(self.buffer) as i32;
             while !IS_BREAKZ!(self.buffer) {
                 self.read_char(&mut string)?;
-                self.read_run(&mut string, 1, |ch| !is_break(ch));
+                self.read_ascii_run(&mut string, 1, &LINE_TEXT, |ch| !is_break(ch));
                 self.cache(1)?;
             }
             // If we hit EOF rather than a line break, stop scanning.

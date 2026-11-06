@@ -163,6 +163,17 @@ impl CharBuffer {
         run
     }
 
+    /// The leading run of at most `max` characters in `class`.
+    #[inline]
+    pub(crate) fn ascii_run(&self, max: usize, class: &PlainAscii) -> Run {
+        let bytes = &self.text.as_bytes()[self.pos..];
+        let len = class.prefix(&bytes[..max.min(bytes.len())]);
+        Run {
+            chars: len,
+            bytes: len,
+        }
+    }
+
     /// The longest leading run of at most `max` characters in `class`, ending
     /// before any trailing blanks.
     #[inline]
