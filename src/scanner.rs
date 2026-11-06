@@ -4,6 +4,7 @@ use std::io::BufRead;
 use crate::buffer::CharBuffer;
 use crate::macros::{is_blank, is_blankz, is_break};
 use crate::reader::yaml_parser_update_buffer;
+use crate::simd::PlainAscii;
 use crate::{
     Encoding, Error, Mark, Result, ScalarStyle, SimpleKey, Token, TokenData, INPUT_BUFFER_SIZE,
 };
@@ -138,6 +139,13 @@ impl<R> Scanner<R> {
     }
 }
 
+/// Printable ASCII that continues a word in a quoted scalar.
+static QUOTED_WORDS: PlainAscii = PlainAscii::new(b"'\"\\");
+/// Printable ASCII that continues a word in a plain scalar, in block context.
+static PLAIN_BLOCK_WORDS: PlainAscii = PlainAscii::new(b":#");
+/// Printable ASCII that continues a word in a plain scalar, in flow context.
+static PLAIN_FLOW_WORDS: PlainAscii = PlainAscii::new(b":#,[]{}");
+
 impl<R: BufRead> Scanner<R> {
     fn cache(&mut self, length: usize) -> Result<()> {
         if self.buffer.len() >= length {
@@ -203,14 +211,13 @@ impl<R: BufRead> Scanner<R> {
     /// `CharBuffer::run_words`). Blanks inside a line are kept as they are in
     /// flow and plain scalars; trailing blanks are left to the caller.
     ///
-    /// `stops` are the ASCII characters (other than blanks and controls) for
-    /// which `ordinary` or `after_blanks` may be false: other printable ASCII
-    /// is read 16 bytes at a time.
+    /// `class` holds blanks and printable ASCII for which `ordinary` and
+    /// `after_blanks` are true: runs of it are read 16 bytes at a time.
     fn read_words(
         &mut self,
         string: &mut String,
         lookahead: usize,
-        stops: &[u8],
+        class: &PlainAscii,
         ordinary: impl Fn(char) -> bool,
         after_blanks: impl Fn(char) -> bool,
     ) {
@@ -220,7 +227,7 @@ impl<R: BufRead> Scanner<R> {
             .len()
             .saturating_sub(lookahead)
             .min(self.buffer.len().saturating_sub(4) + 1);
-        let run = self.buffer.plain_ascii_words(max, stops);
+        let run = self.buffer.plain_ascii_words(max, class);
         self.buffer.take_run(run, string);
         self.mark.index += run.chars as u64;
         self.mark.column += run.chars as u64;
@@ -1781,7 +1788,7 @@ impl<R: BufRead> Scanner<R> {
                         self.read_words(
                             &mut string,
                             2,
-                            b"'\"\\",
+                            &QUOTED_WORDS,
                             |ch| !matches!(ch, '\'' | '"' | '\\') && !is_blankz(ch),
                             |_| true,
                         );
@@ -1945,7 +1952,11 @@ impl<R: BufRead> Scanner<R> {
                 self.read_words(
                     &mut string,
                     2,
-                    if flow { b":#,[]{}" } else { b":#" },
+                    if flow {
+                        &PLAIN_FLOW_WORDS
+                    } else {
+                        &PLAIN_BLOCK_WORDS
+                    },
                     |ch| {
                         ch != ':'
                             && !is_blankz(ch)

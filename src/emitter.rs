@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use crate::macros::{
     is_alpha, is_ascii, is_blank, is_blankz, is_bom, is_break, is_breakz, is_printable, is_space,
 };
+use crate::simd::PlainAscii;
 use crate::{
     Break, Encoding, Error, Event, EventData, MappingStyle, Result, ScalarStyle, SequenceStyle,
     TagDirective, VersionDirective, OUTPUT_BUFFER_SIZE,
@@ -23,6 +24,15 @@ const ORDINARY_BYTE: [bool; 256] = {
     }
     table
 };
+
+/// `ORDINARY_BYTE`s and spaces.
+static ORDINARY_OR_SPACE: PlainAscii = PlainAscii::new(b"\t,?[]{}:#");
+/// What a plain scalar writes as it is (and spaces, which it may fold).
+static PLAIN_TEXT: PlainAscii = PlainAscii::new(b"");
+/// What a single-quoted scalar writes as it is (and spaces).
+static SINGLE_QUOTED_TEXT: PlainAscii = PlainAscii::new(b"'");
+/// What a double-quoted scalar writes as it is (and spaces).
+static DOUBLE_QUOTED_TEXT: PlainAscii = PlainAscii::new(b"\t\"\\");
 
 /// The most strings `Emitter::spare_strings` keeps.
 const MAX_SPARE_STRINGS: usize = 8;
@@ -1262,11 +1272,16 @@ impl<'w> Emitter<'w> {
 
             // After the first character, a run of ordinary bytes only resets
             // the "previous" flags, so skip it in one go.
+            // Spaces between ordinary bytes change nothing either: they are
+            // not first or last, and the next ordinary byte resets the flags.
             if !first && ORDINARY_BYTE[b as usize] {
-                i += 1;
-                while i < len && ORDINARY_BYTE[bytes[i] as usize] {
-                    i += 1;
-                }
+                let run = &bytes[i..];
+                let run = &run[..1 + ORDINARY_OR_SPACE.prefix(&run[1..])];
+                i += run
+                    .iter()
+                    .rposition(|&b| b != b' ')
+                    .expect("starts ordinary")
+                    + 1;
                 previous_space = false;
                 previous_break = false;
                 preceded_by_whitespace = false;
@@ -1615,6 +1630,34 @@ impl<'w> Emitter<'w> {
         Ok(())
     }
 
+    /// The end of the run of `class` from `start` (not a space) that a
+    /// scalar writes as it is: when lines may be folded, up
+    /// to any space past `best_width`, where the writer might fold instead.
+    #[inline(always)]
+    fn ascii_run_end(
+        &self,
+        bytes: &[u8],
+        start: usize,
+        class: &PlainAscii,
+        allow_breaks: bool,
+    ) -> usize {
+        let end = start + 1 + class.prefix(&bytes[start + 1..]);
+        if !allow_breaks {
+            return end;
+        }
+        // The byte `offset` bytes into the run is written at column
+        // `self.column + offset`; a space there folds only past best_width.
+        let unfolded = i64::from(self.best_width) - i64::from(self.column) + 1;
+        let unfolded = start.saturating_add(usize::try_from(unfolded.max(1)).unwrap_or(usize::MAX));
+        if end <= unfolded {
+            return end;
+        }
+        bytes[unfolded..end]
+            .iter()
+            .position(|&b| b == b' ')
+            .map_or(end, |offset| unfolded + offset)
+    }
+
     fn write_plain_scalar(&mut self, value: &str, allow_breaks: bool) -> Result<()> {
         let mut spaces = false;
         let mut breaks = false;
@@ -1639,23 +1682,16 @@ impl<'w> Emitter<'w> {
             // codepoints U+0085, U+2028, U+2029 (multi-byte break chars) are
             // handled by the slow path so their break logic runs.
             if b > 0x20 && b < 0x7f {
-                let start = i;
-                i += 1;
-                while i < len {
-                    let bb = bytes[i];
-                    if !(bb > 0x20 && bb < 0x7f) {
-                        break;
-                    }
-                    i += 1;
-                }
                 if breaks {
                     self.write_indent()?;
                 }
+                let start = i;
+                i = self.ascii_run_end(bytes, start, &PLAIN_TEXT, allow_breaks);
                 let chunk = &value[start..i];
                 self.column += chunk.len() as i32;
                 self.write_text(chunk)?;
                 self.indention = false;
-                spaces = false;
+                spaces = bytes[i - 1] == b' ';
                 breaks = false;
                 continue;
             }
@@ -1727,23 +1763,16 @@ impl<'w> Emitter<'w> {
             let b = bytes[i];
 
             if (0x21..=0x7e).contains(&b) && b != b'\'' {
-                let start = i;
-                i += 1;
-                while i < len {
-                    let bb = bytes[i];
-                    if !((0x21..=0x7e).contains(&bb) && bb != b'\'') {
-                        break;
-                    }
-                    i += 1;
-                }
                 if breaks {
                     self.write_indent()?;
                 }
+                let start = i;
+                i = self.ascii_run_end(bytes, start, &SINGLE_QUOTED_TEXT, allow_breaks);
                 let chunk = &value[start..i];
                 self.column += chunk.len() as i32;
                 self.write_text(chunk)?;
                 self.indention = false;
-                spaces = false;
+                spaces = bytes[i - 1] == b' ';
                 breaks = false;
                 is_first = false;
                 continue;
@@ -1818,12 +1847,9 @@ impl<'w> Emitter<'w> {
         let mut spaces = false;
         self.write_indicator("\"", true, false, false)?;
 
-        // Byte-level loop with batched runs of "safe" ASCII bytes. The original
-        // char-iterator version produced one `write_char` + `flush_if_needed`
-        // per byte, which dominated the profile after S1. A "safe" byte is
-        // printable ASCII (0x21..=0x7e) other than `"` or `\` -- safe for plain
-        // emission without escaping. Long runs of these are written via a
-        // single push_str.
+        // Byte-level loop with batched runs of "safe" ASCII bytes: printable
+        // ASCII other than `"` or `\`, safe for plain emission without
+        // escaping. Long runs of these are written via a single push_str.
         let bytes = value.as_bytes();
         let len = bytes.len();
         let mut i = 0;
@@ -1833,25 +1859,18 @@ impl<'w> Emitter<'w> {
             let b = bytes[i];
 
             // Fast path: batch a run of printable ASCII bytes that need no
-            // escaping. Excludes 0x20 (space, has wrap logic), 0x22 ("), 0x5c
-            // (\). The lower bound 0x21 also excludes all non-printable ASCII.
+            // escaping, starting with one that is not a space (which has wrap
+            // logic). It includes spaces where they cannot wrap.
             if (0x21..=0x7e).contains(&b) && b != b'"' && b != b'\\' {
                 let start = i;
-                i += 1;
-                while i < len {
-                    let bb = bytes[i];
-                    if !((0x21..=0x7e).contains(&bb) && bb != b'"' && bb != b'\\') {
-                        break;
-                    }
-                    i += 1;
-                }
+                i = self.ascii_run_end(bytes, start, &DOUBLE_QUOTED_TEXT, allow_breaks);
                 // start..i bytes are all ASCII (<0x80), so the indices are at
                 // valid char boundaries of `value`; slicing is safe.
                 let chunk = &value[start..i];
                 // Pure ASCII run: column advances by exactly chunk.len().
                 self.column += chunk.len() as i32;
                 self.write_text(chunk)?;
-                spaces = false;
+                spaces = bytes[i - 1] == b' ';
                 first = false;
                 continue;
             }

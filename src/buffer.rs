@@ -1,5 +1,7 @@
 //! The scanner's working buffer of decoded characters.
 
+use crate::simd::PlainAscii;
+
 /// Characters at the front of a [`CharBuffer`].
 #[derive(Clone, Copy)]
 pub(crate) struct Run {
@@ -161,13 +163,13 @@ impl CharBuffer {
         run
     }
 
-    /// The longest leading run of at most `max` characters that are printable
-    /// ASCII or blanks and not in `stops`, ending before any trailing blanks.
+    /// The longest leading run of at most `max` characters in `class`, ending
+    /// before any trailing blanks.
     #[inline]
-    pub(crate) fn plain_ascii_words(&self, max: usize, stops: &[u8]) -> Run {
+    pub(crate) fn plain_ascii_words(&self, max: usize, class: &PlainAscii) -> Run {
         let bytes = &self.text.as_bytes()[self.pos..];
         let bytes = &bytes[..max.min(bytes.len())];
-        let span = &bytes[..crate::simd::plain_ascii_prefix(bytes, stops)];
+        let span = &bytes[..class.prefix(bytes)];
         let end = span
             .iter()
             .rposition(|&b| b != b' ' && b != b'\t')
