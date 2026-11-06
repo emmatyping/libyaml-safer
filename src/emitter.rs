@@ -1276,7 +1276,7 @@ impl<'w> Emitter<'w> {
             // not first or last, and the next ordinary byte resets the flags.
             if !first && ORDINARY_BYTE[b as usize] {
                 let run = &bytes[i..];
-                let run = &run[..1 + ORDINARY_OR_SPACE.prefix(&run[1..])];
+                let run = &run[..1 + ORDINARY_OR_SPACE.short_prefix(&run[1..])];
                 i += run
                     .iter()
                     .rposition(|&b| b != b' ')
@@ -1641,7 +1641,7 @@ impl<'w> Emitter<'w> {
         class: &PlainAscii,
         allow_breaks: bool,
     ) -> usize {
-        let end = start + 1 + class.prefix(&bytes[start + 1..]);
+        let end = start + 1 + class.short_prefix(&bytes[start + 1..]);
         if !allow_breaks {
             return end;
         }

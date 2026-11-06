@@ -89,10 +89,16 @@ impl PlainAscii {
         self.table[byte as usize]
     }
 
-    /// The length of the leading run of `bytes` in the class. Short runs are
-    /// common, so the first few bytes are checked one at a time.
+    /// The length of the leading run of `bytes` in the class.
     #[inline(always)]
     pub(crate) fn prefix(&self, bytes: &[u8]) -> usize {
+        plain_ascii_prefix(bytes, self.stops)
+    }
+
+    /// `prefix`, for runs that are usually short: the first few bytes are
+    /// checked one at a time.
+    #[inline(always)]
+    pub(crate) fn short_prefix(&self, bytes: &[u8]) -> usize {
         const SCALAR: usize = 8;
         let head = &bytes[..bytes.len().min(SCALAR)];
         match head.iter().position(|&b| !self.contains(b)) {
@@ -174,10 +180,9 @@ mod tests {
                         &PlainAscii::new(b"'\"\\"),
                         &PlainAscii::new(b":#,[]{}"),
                     ] {
-                        assert_eq!(
-                            class.prefix(&bytes),
-                            scalar_plain_prefix(&bytes, 0, class.stops)
-                        );
+                        let expected = scalar_plain_prefix(&bytes, 0, class.stops);
+                        assert_eq!(class.prefix(&bytes), expected);
+                        assert_eq!(class.short_prefix(&bytes), expected);
                     }
                 }
             }
