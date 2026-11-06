@@ -34,6 +34,7 @@ mod event;
 mod parser;
 mod reader;
 mod scanner;
+mod simd;
 mod token;
 
 pub use crate::document::*;
