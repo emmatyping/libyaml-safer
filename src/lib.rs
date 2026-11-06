@@ -75,7 +75,6 @@ pub const DEFAULT_MAPPING_TAG: &str = MAP_TAG;
 
 /// The version directive data.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[non_exhaustive]
 pub struct VersionDirective {
     /// The major version number.
     pub major: i32,
@@ -85,7 +84,6 @@ pub struct VersionDirective {
 
 /// The tag directive data.
 #[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
 pub struct TagDirective {
     /// The tag handle.
     pub handle: String,

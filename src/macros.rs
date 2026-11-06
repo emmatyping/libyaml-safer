@@ -68,7 +68,12 @@ pub(crate) fn is_ascii(ch: char) -> bool {
     ch.is_ascii()
 }
 
+/// libyaml's `IS_PRINTABLE`, which only accepts characters of up to three
+/// UTF-8 bytes: characters beyond the Basic Multilingual Plane are escaped.
 pub(crate) fn is_printable(ch: char) -> bool {
+    if ch.is_ascii() {
+        return ch == '\n' || matches!(ch, '\x20'..='\x7e');
+    }
     match ch {
         '\u{feff}' | '\u{fffe}' | '\u{ffff}' => false,
         // ASCII
@@ -78,8 +83,7 @@ pub(crate) fn is_printable(ch: char) -> bool {
         | '\u{00c0}'..='\u{cfff}'
         | '\u{d000}'..='\u{d7ff}'
         | '\u{e000}'..='\u{efff}'
-        | '\u{f000}'..='\u{fffd}'
-        | '\u{10000}'..='\u{10ffff}' => true,
+        | '\u{f000}'..='\u{fffd}' => true,
         _ => false,
     }
 }
@@ -103,7 +107,7 @@ macro_rules! IS_BOM {
 }
 
 pub(crate) fn is_bom(ch: char) -> bool {
-    ch == '\u{7eff}'
+    ch == '\u{feff}'
 }
 
 macro_rules! IS_SPACE_AT {
@@ -216,12 +220,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bom() {
+        assert!(is_bom('\u{feff}'));
+        assert!(!is_bom('\u{7eff}'));
+    }
+
+    #[test]
     fn printable() {
-        for ch in "🎉".chars() {
-            assert!(is_printable(ch));
+        for ch in ['a', '\n', '\u{a0}', 'é', '\u{d7ff}', '\u{e000}', '\u{fffd}'] {
+            assert!(is_printable(ch), "{ch:?}");
         }
-        for ch in "\u{1f389}".chars() {
-            assert!(is_printable(ch));
+        // Like libyaml: no 4-byte UTF-8 characters, BOM, U+FFFE/U+FFFF,
+        // controls (tab, NEL) or surrogate range neighbours.
+        for ch in [
+            '\u{1f389}',
+            '\u{10000}',
+            '\u{feff}',
+            '\u{fffe}',
+            '\t',
+            '\u{85}',
+        ] {
+            assert!(!is_printable(ch), "{ch:?}");
         }
     }
 }

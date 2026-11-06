@@ -144,7 +144,7 @@ impl Event {
     pub fn scalar(
         anchor: Option<&str>,
         tag: Option<&str>,
-        value: &str,
+        value: impl Into<String>,
         plain_implicit: bool,
         quoted_implicit: bool,
         style: ScalarStyle,
@@ -162,7 +162,7 @@ impl Event {
         Self::new(EventData::Scalar {
             anchor: anchor_copy,
             tag: tag_copy,
-            value: String::from(value),
+            value: value.into(),
             plain_implicit,
             quoted_implicit,
             style,

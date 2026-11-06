@@ -8,12 +8,33 @@ use crate::{
     TagDirective, VersionDirective, OUTPUT_BUFFER_SIZE,
 };
 
+/// Bytes that, after a scalar's first character, change nothing in
+/// `analyze_scalar` but the "previous character" flags: printable ASCII other
+/// than space and the indicators checked mid-scalar (`,?[]{}:#`).
+const ORDINARY_BYTE: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut b = 0x21;
+    while b <= 0x7e {
+        table[b] = !matches!(
+            b as u8,
+            b',' | b'?' | b'[' | b']' | b'{' | b'}' | b':' | b'#'
+        );
+        b += 1;
+    }
+    table
+};
+
+/// The most strings `Emitter::spare_strings` keeps.
+const MAX_SPARE_STRINGS: usize = 8;
+
 /// The emitter structure.
 ///
 /// All members are internal. Manage the structure using the `yaml_emitter_`
 /// family of functions.
 #[non_exhaustive]
 pub struct Emitter<'w> {
+    /// Values of emitted scalar events, for `take_spare_string`.
+    spare_strings: Vec<String>,
     /// Write handler.
     pub(crate) write_handler: Option<&'w mut (dyn std::io::Write + Send + Sync)>,
     /// The working buffer.
@@ -177,6 +198,7 @@ impl<'w> Emitter<'w> {
     /// Create an self.
     pub fn new() -> Emitter<'w> {
         Emitter {
+            spare_strings: Vec::new(),
             write_handler: None,
             buffer: String::with_capacity(OUTPUT_BUFFER_SIZE),
             raw_buffer: Vec::with_capacity(OUTPUT_BUFFER_SIZE),
@@ -241,15 +263,14 @@ impl<'w> Emitter<'w> {
         Ok(())
     }
 
-    /// Set a string output.
+    /// Set a byte buffer output.
     ///
-    /// The emitter will write the output characters to the `output` buffer.
+    /// The emitter will write the encoded output to the `output` buffer:
+    /// UTF-8 unless a UTF-16 encoding has been set.
     pub fn set_output_string(&mut self, output: &'w mut Vec<u8>) {
         assert!(self.write_handler.is_none());
         if self.encoding == Encoding::Any {
             self.set_encoding(Encoding::Utf8);
-        } else if self.encoding != Encoding::Utf8 {
-            panic!("cannot output UTF-16 to String")
         }
         output.clear();
         self.write_handler = Some(output);
@@ -300,20 +321,62 @@ impl<'w> Emitter<'w> {
     /// the responsibility for the event object and destroys its content after
     /// it is emitted. The event object is destroyed even if the function fails.
     pub fn emit(&mut self, event: Event) -> Result<()> {
+        // An event that needs no lookahead, with none waiting before it, is
+        // processed at once (as the loop below would) without queueing it.
+        if self.events.is_empty()
+            && !matches!(
+                event.data,
+                EventData::DocumentStart { .. }
+                    | EventData::SequenceStart { .. }
+                    | EventData::MappingStart { .. }
+            )
+        {
+            return self.process_event(event);
+        }
         self.events.push_back(event);
         while let Some(event) = self.needs_mode_events() {
-            let tag_directives = core::mem::take(&mut self.tag_directives);
+            self.process_event(event)?;
+        }
+        Ok(())
+    }
 
-            let mut analysis = self.analyze_event(&event, &tag_directives)?;
-            self.state_machine(&event, &mut analysis)?;
+    fn process_event(&mut self, event: Event) -> Result<()> {
+        let tag_directives = core::mem::take(&mut self.tag_directives);
 
-            // The DOCUMENT-START event populates the tag directives, and this
-            // happens only once, so don't swap out the tags in that case.
+        let result = self
+            .analyze_event(&event, &tag_directives)
+            .and_then(|mut analysis| self.state_machine(&event, &mut analysis));
+        if let Err(error) = result {
+            // libyaml leaves a failed event at the head of the queue, so
+            // the next call processes it again (after a failed write, for
+            // example).
+            self.events.push_front(event);
             if self.tag_directives.is_empty() {
                 self.tag_directives = tag_directives;
             }
+            return Err(error);
+        }
+
+        // The DOCUMENT-START event populates the tag directives, and this
+        // happens only once, so don't swap out the tags in that case.
+        if self.tag_directives.is_empty() {
+            self.tag_directives = tag_directives;
+        }
+        if let EventData::Scalar { value, .. } = event.data {
+            if self.spare_strings.len() < MAX_SPARE_STRINGS {
+                self.spare_strings.push(value);
+            }
         }
         Ok(())
+    }
+
+    /// An empty string with the capacity of an emitted scalar's value, if
+    /// one is spare, to build the next scalar event's value in without
+    /// allocating.
+    pub fn take_spare_string(&mut self) -> String {
+        let mut string = self.spare_strings.pop().unwrap_or_default();
+        string.clear();
+        string
     }
 
     /// Equivalent of the libyaml `FLUSH` macro.
@@ -352,20 +415,29 @@ impl<'w> Emitter<'w> {
     /// `emitter.column` the appropriate number of times. It is assumed that the
     /// string does not contain line breaks!
     fn write_str(&mut self, string: &str) -> Result<()> {
-        if self.buffer.len() + string.len() > OUTPUT_BUFFER_SIZE {
-            self.flush()?;
-        }
-
-        // Note: Reserves less than what is necessary if there are UTF-8
-        // characters present.
-        self.buffer.reserve(string.len());
-
         self.column += string.chars().count() as i32;
+        self.write_text(string)
+    }
 
-        // Note: This may cause the buffer to become slightly larger than
-        // `OUTPUT_BUFFER_SIZE`, but not by much.
-        self.buffer.push_str(string);
-
+    /// Append `text` to the buffer, flushing where libyaml would: its `FLUSH`
+    /// check runs before every character and flushes once fewer than 5 bytes
+    /// are free, so the output reaches the writer in the same pieces. Does not
+    /// update the column.
+    fn write_text(&mut self, mut text: &str) -> Result<()> {
+        while !text.is_empty() {
+            let room = (OUTPUT_BUFFER_SIZE - 5).saturating_sub(self.buffer.len());
+            if room == 0 {
+                self.flush()?;
+                continue;
+            }
+            // Every character starting before `room` is written unflushed.
+            let mut end = room.min(text.len());
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            self.buffer.push_str(&text[..end]);
+            text = &text[end..];
+        }
         Ok(())
     }
 
@@ -1188,6 +1260,19 @@ impl<'w> Emitter<'w> {
         while i < len {
             let b = bytes[i];
 
+            // After the first character, a run of ordinary bytes only resets
+            // the "previous" flags, so skip it in one go.
+            if !first && ORDINARY_BYTE[b as usize] {
+                i += 1;
+                while i < len && ORDINARY_BYTE[bytes[i] as usize] {
+                    i += 1;
+                }
+                previous_space = false;
+                previous_break = false;
+                preceded_by_whitespace = false;
+                continue;
+            }
+
             if b < 0x80 {
                 let next_pos = i + 1;
                 let at_end = next_pos >= len;
@@ -1567,12 +1652,8 @@ impl<'w> Emitter<'w> {
                     self.write_indent()?;
                 }
                 let chunk = &value[start..i];
-                if self.buffer.len() + chunk.len() > OUTPUT_BUFFER_SIZE {
-                    self.flush()?;
-                }
-                self.buffer.reserve(chunk.len());
                 self.column += chunk.len() as i32;
-                self.buffer.push_str(chunk);
+                self.write_text(chunk)?;
                 self.indention = false;
                 spaces = false;
                 breaks = false;
@@ -1659,12 +1740,8 @@ impl<'w> Emitter<'w> {
                     self.write_indent()?;
                 }
                 let chunk = &value[start..i];
-                if self.buffer.len() + chunk.len() > OUTPUT_BUFFER_SIZE {
-                    self.flush()?;
-                }
-                self.buffer.reserve(chunk.len());
                 self.column += chunk.len() as i32;
-                self.buffer.push_str(chunk);
+                self.write_text(chunk)?;
                 self.indention = false;
                 spaces = false;
                 breaks = false;
@@ -1771,13 +1848,9 @@ impl<'w> Emitter<'w> {
                 // start..i bytes are all ASCII (<0x80), so the indices are at
                 // valid char boundaries of `value`; slicing is safe.
                 let chunk = &value[start..i];
-                if self.buffer.len() + chunk.len() > OUTPUT_BUFFER_SIZE {
-                    self.flush()?;
-                }
-                self.buffer.reserve(chunk.len());
                 // Pure ASCII run: column advances by exactly chunk.len().
                 self.column += chunk.len() as i32;
-                self.buffer.push_str(chunk);
+                self.write_text(chunk)?;
                 spaces = false;
                 first = false;
                 continue;
@@ -1873,6 +1946,15 @@ impl<'w> Emitter<'w> {
                     }
                 }
                 spaces = false;
+            } else if ch == ' ' && spaces {
+                // After a space, spaces cannot start a line break (libyaml
+                // checks `!spaces`), so write the whole run.
+                let run = bytes[i..].iter().take_while(|&&b| b == b' ').count();
+                self.column += run as i32;
+                self.write_text(&value[i..i + run])?;
+                first = false;
+                i += run;
+                continue;
             } else if ch == ' ' {
                 // Space: needs lookahead for wrap/line-continuation logic.
                 let next_pos = i + ch_len;
@@ -1989,9 +2071,15 @@ impl<'w> Emitter<'w> {
         while let Some(ch) = chars.next() {
             if is_break(ch) {
                 if !breaks && !leading_spaces && ch == '\n' {
-                    let mut skip_breaks = chars.clone();
-                    while is_break(skip_breaks.next()) {}
-                    if !is_blankz(skip_breaks.next()) {
+                    // libyaml: the first character after this run of breaks.
+                    let mut rest = chars.clone();
+                    let after_breaks = loop {
+                        let next = rest.next();
+                        if !is_break(next) {
+                            break next;
+                        }
+                    };
+                    if !is_blankz(after_breaks) {
                         self.put_break()?;
                     }
                 }
@@ -2030,11 +2118,16 @@ impl<'w> Emitter<'w> {
 
         if self.encoding == Encoding::Utf8 {
             let to_emit = self.buffer.as_bytes();
-            self.write_handler
+            let result = self
+                .write_handler
                 .as_mut()
                 .expect("non-null writer")
-                .write_all(to_emit)?;
+                .write_all(to_emit);
+            // libyaml rewinds its buffer before writing, so even output that
+            // could not be written is dropped. (For UTF-16 it keeps both the
+            // buffer and the encoded output, as below.)
             self.buffer.clear();
+            result?;
             return Ok(());
         }
 
