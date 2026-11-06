@@ -161,6 +161,23 @@ impl CharBuffer {
         run
     }
 
+    /// The longest leading run of at most `max` characters that are printable
+    /// ASCII or blanks and not in `stops`, ending before any trailing blanks.
+    #[inline]
+    pub(crate) fn plain_ascii_words(&self, max: usize, stops: &[u8]) -> Run {
+        let bytes = &self.text.as_bytes()[self.pos..];
+        let bytes = &bytes[..max.min(bytes.len())];
+        let span = &bytes[..crate::simd::plain_ascii_prefix(bytes, stops)];
+        let end = span
+            .iter()
+            .rposition(|&b| b != b' ' && b != b'\t')
+            .map_or(0, |last| last + 1);
+        Run {
+            chars: end,
+            bytes: end,
+        }
+    }
+
     /// The character at byte offset `at` of the unconsumed text.
     #[inline(always)]
     fn char_at_byte(&self, at: usize) -> Option<char> {

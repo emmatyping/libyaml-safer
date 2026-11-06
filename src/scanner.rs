@@ -202,13 +202,28 @@ impl<R: BufRead> Scanner<R> {
     /// `read_run` for runs that may contain blanks between words (see
     /// `CharBuffer::run_words`). Blanks inside a line are kept as they are in
     /// flow and plain scalars; trailing blanks are left to the caller.
+    ///
+    /// `stops` are the ASCII characters (other than blanks and controls) for
+    /// which `ordinary` or `after_blanks` may be false: other printable ASCII
+    /// is read 16 bytes at a time.
     fn read_words(
         &mut self,
         string: &mut String,
         lookahead: usize,
+        stops: &[u8],
         ordinary: impl Fn(char) -> bool,
         after_blanks: impl Fn(char) -> bool,
     ) {
+        // Every word in this run starts where `run_words` allows it to.
+        let max = self
+            .buffer
+            .len()
+            .saturating_sub(lookahead)
+            .min(self.buffer.len().saturating_sub(4) + 1);
+        let run = self.buffer.plain_ascii_words(max, stops);
+        self.buffer.take_run(run, string);
+        self.mark.index += run.chars as u64;
+        self.mark.column += run.chars as u64;
         self.read_run(string, lookahead, &ordinary);
         // Most runs end at a line break or an indicator, not at a blank.
         if !matches!(self.buffer.front(), Some(' ' | '\t')) {
@@ -1766,6 +1781,7 @@ impl<R: BufRead> Scanner<R> {
                         self.read_words(
                             &mut string,
                             2,
+                            b"'\"\\",
                             |ch| !matches!(ch, '\'' | '"' | '\\') && !is_blankz(ch),
                             |_| true,
                         );
@@ -1929,6 +1945,7 @@ impl<R: BufRead> Scanner<R> {
                 self.read_words(
                     &mut string,
                     2,
+                    if flow { b":#,[]{}" } else { b":#" },
                     |ch| {
                         ch != ':'
                             && !is_blankz(ch)
