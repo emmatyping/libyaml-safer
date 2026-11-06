@@ -9,7 +9,10 @@ edition = "2021"
 keywords = ["yaml"]
 license-file = "LICENSE-MIT"
 repository = "https://github.com/simonask/libyaml-safer"
-rust-version = "1.64"
+rust-version = "1.89"
+
+[dependencies]
+fearless_simd = "1.2"
 
 [dev-dependencies]
 # To test on 1.64,1.75,etc, comment out `criterion`.

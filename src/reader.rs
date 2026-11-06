@@ -257,24 +257,31 @@ fn is_allowed(ch: char) -> bool {
 /// character before the first one that is not allowed is pushed.
 fn push_str(out: &mut CharBuffer, valid: &str, offset: &mut usize) -> Result<()> {
     let bytes = valid.as_bytes();
-    // Printable ASCII, tabs and line breaks are allowed.
-    let ascii = bytes
-        .iter()
-        .position(|&b| !(b >= 0x20 && b < 0x7f || b == b'\t' || b == b'\n' || b == b'\r'))
-        .unwrap_or(bytes.len());
-    let mut chars = ascii;
-    for (index, ch) in valid[ascii..].char_indices() {
-        let index = ascii + index;
-        if !is_allowed(ch) {
-            out.push_str(&valid[..index], chars);
-            *offset += index;
-            return Err(Error::reader(
-                "control characters are not allowed",
-                *offset,
-                ch as _,
-            ));
+    let mut at = 0;
+    let mut chars = 0;
+    while at < bytes.len() {
+        // Printable ASCII, tabs and line breaks are allowed.
+        let ascii = crate::simd::allowed_ascii_prefix(&bytes[at..]);
+        at += ascii;
+        chars += ascii;
+        // Then other characters, up to the next ASCII.
+        while at < bytes.len() {
+            let ch = valid[at..].chars().next().expect("at a character boundary");
+            if !is_allowed(ch) {
+                out.push_str(&valid[..at], chars);
+                *offset += at;
+                return Err(Error::reader(
+                    "control characters are not allowed",
+                    *offset,
+                    ch as _,
+                ));
+            }
+            at += ch.len_utf8();
+            chars += 1;
+            if bytes.get(at).is_some_and(u8::is_ascii) {
+                break;
+            }
         }
-        chars += 1;
     }
     out.push_str(valid, chars);
     *offset += valid.len();
