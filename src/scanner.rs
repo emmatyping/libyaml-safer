@@ -149,6 +149,7 @@ static PLAIN_BLOCK_WORDS: PlainAscii = PlainAscii::new(b":#");
 static PLAIN_FLOW_WORDS: PlainAscii = PlainAscii::new(b":#,[]{}");
 
 impl<R: BufRead> Scanner<R> {
+    #[inline(always)]
     fn cache(&mut self, length: usize) -> Result<()> {
         if self.buffer.len() >= length {
             Ok(())

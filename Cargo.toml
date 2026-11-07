@@ -17,6 +17,8 @@ fearless_simd = "1.2"
 [dev-dependencies]
 # To test on 1.64,1.75,etc, comment out `criterion`.
 criterion = "0.5.1"
+# The fallback level, so tests can check the scans without SIMD.
+fearless_simd = { version = "1.2", features = ["force_support_fallback"] }
 pretty_assertions = "1.0"
 unsafe-libyaml = "0.2.10"
 unsafe-libyaml-test-suite = { path = "tests/data" }

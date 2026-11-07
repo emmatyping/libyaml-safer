@@ -399,6 +399,7 @@ impl<'w> Emitter<'w> {
     }
 
     /// Equivalent of the libyaml `PUT` macro.
+    #[inline(always)]
     fn put(&mut self, value: char) -> Result<()> {
         self.flush_if_needed()?;
         self.buffer.push(value);
@@ -452,6 +453,7 @@ impl<'w> Emitter<'w> {
     }
 
     /// Equivalent of the libyaml `WRITE` macro.
+    #[inline(always)]
     fn write_char(&mut self, ch: char) -> Result<()> {
         self.flush_if_needed()?;
         self.buffer.push(ch);
